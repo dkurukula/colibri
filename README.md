@@ -60,15 +60,28 @@ Cold starts are heavy on random reads (~11 GB/token), but reads don't meaningful
 
 ## Download the model
 
-A pre-converted **GLM-5.2 int4** model for colibrì is available on Hugging Face:
+**Fastest path — one command** downloads the real 744B GLM-5.2 int4 model and
+benchmarks it: asks you to confirm (or change) the download location, checks
+free disk space *before* touching the network, automatically detects and
+fixes the int4-vs-int8 MTP head gotcha below (no manual file-size checking),
+builds for your CPU, and runs the full benchmark:
+
+```bash
+cd c
+make quickstart                    # interactive: confirms before downloading anything
+make quickstart ARGS="-y"          # non-interactive: accepts every default (~/glm52_i4)
+```
+
+Useful flags via `ARGS="..."`: `--dir PATH` (download location, default
+`~/glm52_i4`), `--arch ivybridge` (AVX-only CPUs — see "CPU tier" below),
+`--skip-download` (model's already there, just build+benchmark). Full list:
+`bash scripts/quickstart.sh --help` or `c/scripts/quickstart.sh`.
+
+### Manual download
+
+A pre-converted **GLM-5.2 int4** model is also available directly on Hugging Face:
 
 **https://huggingface.co/jlnsrk/GLM-5.2-colibri-int4**
-
-If the MTP files there are still the int4 head (see [#8](https://github.com/JustVugg/colibri/issues/8) — sizes `1765523544/2686077736/536747200` = int4, unusable), grab the **int8 MTP heads** from the community clone by matey-0: **https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
-
-Download it straight to `~/glm52_i4` (any local ext4/NTFS path with ~370 GB
-free works — this is just a default that exists on every machine; override it
-if you keep models somewhere else):
 
 ```bash
 pip install -U "huggingface_hub[cli]"
@@ -76,6 +89,8 @@ huggingface-cli download jlnsrk/GLM-5.2-colibri-int4 --local-dir ~/glm52_i4
 
 COLI_MODEL=~/glm52_i4 ./coli chat
 ```
+
+If the MTP files there are still the int4 head (see [#8](https://github.com/JustVugg/colibri/issues/8) — sizes `1765523544/2686077736/536747200` = int4, unusable), grab the **int8 MTP heads** from the community clone by matey-0: **https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp** (`make quickstart` above checks for and fixes this automatically).
 
 This skips the FP8 → int4 conversion step entirely.
 
@@ -382,6 +397,16 @@ The model itself doesn't care which CPU tier built the engine — it's the same
 | RAM | **16 GB floor**, 25 GB+ comfortable | ~9.9 GB dense stays resident; the rest is expert cache — more RAM = higher hit-rate = fewer disk reads/token |
 | CPU | any Sandy/Ivy Bridge-class x86-64 (2011+, has AVX) | gets the vectorized AVX+SSSE3 kernels below instead of the scalar fallback |
 
+The single-command path from "Download the model" above already does all of
+this correctly on Ivy Bridge — just tell it which `ARCH` to build:
+
+```bash
+cd c
+make quickstart ARGS="--arch ivybridge -y"    # download + build (AVX-only) + benchmark, one shot
+```
+
+Or step by step, if you'd rather see/control each part:
+
 ```bash
 cd c
 make ARCH=ivybridge                     # AVX-only build (no AVX2/FMA required)
@@ -412,6 +437,11 @@ actually runs under an emulated Ivy Bridge CPU while an AVX2 build SIGILLs
 under the same CPU model.
 
 ### Benchmark the full model
+
+`make quickstart` (see "Download the model" above) already downloads the
+model *and* runs this benchmark in one shot — this section is for benchmarking
+a model you already have, or for running each step individually with more
+control (e.g. a higher `--limit` on the quality suite).
 
 One copy-paste block, four steps, using the **real 744B GLM-5.2 model** (not a
 fixture) end to end: build for your CPU, measure your disk the way the engine

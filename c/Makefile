@@ -140,4 +140,12 @@ clean:
 bench-cpu-tiers:
 	bash scripts/bench_cpu_tiers.sh
 
-.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean bench-cpu-tiers
+# One command: download the real 744B GLM-5.2 int4 model and benchmark it.
+# Asks for/confirms a download location, checks free disk space first, fixes
+# the known int4-vs-int8 MTP head gotcha automatically, builds for this CPU,
+# then runs the disk/decode/quality benchmark. Pass ARGS="..." for flags, e.g:
+#   make quickstart ARGS="-y --dir /data/glm52 --arch ivybridge"
+quickstart:
+	bash scripts/quickstart.sh $(ARGS)
+
+.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean bench-cpu-tiers quickstart
