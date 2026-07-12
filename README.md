@@ -66,10 +66,15 @@ A pre-converted **GLM-5.2 int4** model for colibrì is available on Hugging Face
 
 If the MTP files there are still the int4 head (see [#8](https://github.com/JustVugg/colibri/issues/8) — sizes `1765523544/2686077736/536747200` = int4, unusable), grab the **int8 MTP heads** from the community clone by matey-0: **https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
 
-Download the repository and point `COLI_MODEL` to its directory:
+Download it straight to `~/glm52_i4` (any local ext4/NTFS path with ~370 GB
+free works — this is just a default that exists on every machine; override it
+if you keep models somewhere else):
 
 ```bash
-COLI_MODEL=/path/to/GLM-5.2-colibri-int4 ./coli chat
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download jlnsrk/GLM-5.2-colibri-int4 --local-dir ~/glm52_i4
+
+COLI_MODEL=~/glm52_i4 ./coli chat
 ```
 
 This skips the FP8 → int4 conversion step entirely.
@@ -381,14 +386,14 @@ The model itself doesn't care which CPU tier built the engine — it's the same
 cd c
 make ARCH=ivybridge                     # AVX-only build (no AVX2/FMA required)
 
-# get the model — pick ONE:
-#   (a) download the pre-converted int4 model (~370 GB, skips conversion):
-#       see "Download the model" above, then just point COLI_MODEL at it
-#   (b) convert it yourself (needs ~400 GB free, python: pip install torch safetensors huggingface_hub numpy):
-./coli convert --model /path/to/glm52_i4
+# get the model — pick ONE (default path ~/glm52_i4; override if you keep models elsewhere):
+pip install -U "huggingface_hub[cli]"                              # (a) pre-converted, skips conversion
+huggingface-cli download jlnsrk/GLM-5.2-colibri-int4 --local-dir ~/glm52_i4
+# — or —
+./coli convert --model ~/glm52_i4                                  # (b) convert FP8 yourself, needs ~400 GB free
 
 # run it — RAM budget, expert cache and MTP are all detected automatically:
-COLI_MODEL=/path/to/glm52_i4 ./coli chat --ram 16     # set --ram to whatever you actually have free
+COLI_MODEL=~/glm52_i4 ./coli chat --ram 16     # set --ram to whatever you actually have free
 ```
 
 Expect it to be **disk-bound, not CPU-bound**, at this scale (see the
@@ -417,7 +422,7 @@ otherwise.
 
 ```bash
 cd c
-MODEL=/path/to/glm52_i4                      # your downloaded/converted int4 model
+MODEL=~/glm52_i4                             # your downloaded/converted int4 model (see "Download the model" above)
 ARCH=native                                  # or: ivybridge / sandybridge / x86-64-v3
 
 # 0) build + architecture self-test (expects 32/32):
