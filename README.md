@@ -366,6 +366,15 @@ hardware — `ARCH=ivybridge` only matters when cross-building a binary for a
 different, AVX-only machine. Startup logs the kernel actually picked
 (`idot: avx2` / `idot: ssse3` / `idot: scalar` / `idot: avx512-vnni`).
 
+Reproduce this: `make bench-cpu-tiers` builds all four tiers, runs real forward
+passes (prefill + autoregressive decode) against generated tiny/medium
+random-weight fixtures, asserts every tier agrees, and prints the kernel
+timing table above (see `c/scripts/bench_cpu_tiers.sh`; one-time need for
+fixture generation: `pip install torch transformers safetensors`). With
+`qemu-user-static` installed it additionally proves the Ivy Bridge build
+actually runs under an emulated Ivy Bridge CPU while an AVX2 build SIGILLs
+under the same CPU model.
+
 **How to test it, in order:**
 
 ```bash

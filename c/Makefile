@@ -133,4 +133,11 @@ clean:
 	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean
+# Reproducible correctness + benchmark harness for the CPU vector-ISA tiers
+# (AVX-512 / AVX2+FMA / AVX-only+SSSE3 "Ivy Bridge" / scalar). Builds all four,
+# checks they agree, times the quantized matmul kernel. Needs (one-time, only
+# to generate the fixtures if missing): pip install torch transformers safetensors
+bench-cpu-tiers:
+	bash scripts/bench_cpu_tiers.sh
+
+.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean bench-cpu-tiers
