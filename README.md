@@ -335,6 +335,14 @@ colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe be
 
 ### CPU tier: pick the build that matches your vector ISA
 
+> **Fork note:** this repository is a fork of [JustVugg/colibri](https://github.com/JustVugg/colibri).
+> Upstream colibrì assumes an AVX2 CPU (Haswell, 2013+) and falls back to plain
+> scalar C otherwise — that's a deliberate upstream choice, not a bug, and it is
+> **not** something the original author designed around AVX-only hardware for.
+> This fork adds the AVX-only code path below (Sandy/Ivy Bridge, 2011-2012:
+> vectorized AVX float matmuls + SSSE3 integer dot product, no AVX2/FMA) so the
+> engine also runs vectorized — not scalar — on that older hardware.
+
 | CPU | build | matmul kernel | IDOT kernel |
 |---|---|---|---|
 | Haswell+ (2013+), AVX2/FMA | `make` (`ARCH=native`, default) | AVX2 FMA | avx2 |
