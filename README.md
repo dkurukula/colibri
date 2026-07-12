@@ -366,6 +366,37 @@ hardware — `ARCH=ivybridge` only matters when cross-building a binary for a
 different, AVX-only machine. Startup logs the kernel actually picked
 (`idot: avx2` / `idot: ssse3` / `idot: scalar` / `idot: avx512-vnni`).
 
+### Running GLM-5.2 on Ivy Bridge hardware
+
+The model itself doesn't care which CPU tier built the engine — it's the same
+744B GLM-5.2 int4 checkpoint either way. What you need, concretely:
+
+| requirement | how much | why |
+|---|---|---|
+| disk (local ext4/NTFS, **not** `/mnt/c` or network/9p) | **~370 GB** for the int4 model, **~400 GB free** while converting locally (deletes each FP8 shard as it goes) | streamed on demand at inference time |
+| RAM | **16 GB floor**, 25 GB+ comfortable | ~9.9 GB dense stays resident; the rest is expert cache — more RAM = higher hit-rate = fewer disk reads/token |
+| CPU | any Sandy/Ivy Bridge-class x86-64 (2011+, has AVX) | gets the vectorized AVX+SSSE3 kernels below instead of the scalar fallback |
+
+```bash
+cd c
+make ARCH=ivybridge                     # AVX-only build (no AVX2/FMA required)
+
+# get the model — pick ONE:
+#   (a) download the pre-converted int4 model (~370 GB, skips conversion):
+#       see "Download the model" above, then just point COLI_MODEL at it
+#   (b) convert it yourself (needs ~400 GB free, python: pip install torch safetensors huggingface_hub numpy):
+./coli convert --model /path/to/glm52_i4
+
+# run it — RAM budget, expert cache and MTP are all detected automatically:
+COLI_MODEL=/path/to/glm52_i4 ./coli chat --ram 16     # set --ram to whatever you actually have free
+```
+
+Expect it to be **disk-bound, not CPU-bound**, at this scale (see the
+back-of-envelope table below) — the AVX kernels mainly matter for the matmul
+share of that time (roughly 2× the scalar fallback on int8, ~6× on int4; see
+the reproducible benchmark table above) and for keeping the engine off the
+"illegal instruction" crash an AVX2-only build would hit on this hardware.
+
 Reproduce this: `make bench-cpu-tiers` builds all four tiers, runs real forward
 passes (prefill + autoregressive decode) against generated tiny/medium
 random-weight fixtures, asserts every tier agrees, and prints the kernel
@@ -375,26 +406,42 @@ fixture generation: `pip install torch transformers safetensors`). With
 actually runs under an emulated Ivy Bridge CPU while an AVX2 build SIGILLs
 under the same CPU model.
 
-**How to test it, in order:**
+### Benchmark the full model
+
+One copy-paste block, four steps, using the **real 744B GLM-5.2 model** (not a
+fixture) end to end: build for your CPU, measure your disk the way the engine
+actually reads it, measure decode speed, then run the quality suite. Set
+`MODEL` and `ARCH` once at the top and the rest is unchanged for any machine
+— `ARCH=ivybridge` (or `sandybridge`) if that's your CPU tier, `native`
+otherwise.
 
 ```bash
-cd c && ./setup.sh                 # build + architecture self-test (expects 32/32)
+cd c
+MODEL=/path/to/glm52_i4                      # your downloaded/converted int4 model
+ARCH=native                                  # or: ivybridge / sandybridge / x86-64-v3
+
+# 0) build + architecture self-test (expects 32/32):
+ARCH="$ARCH" ./setup.sh
 
 # 1) measure YOUR disk the way the engine uses it (parallel 19 MB random reads):
 gcc -O2 -fopenmp iobench.c -o iobench
-./iobench /path/to/glm52_i4/out-00069.safetensors 19 64 8 0   # buffered, 8 threads
-./iobench /path/to/glm52_i4/out-00069.safetensors 19 64 8 1   # O_DIRECT
+./iobench "$MODEL"/out-00069.safetensors 19 64 8 0   # buffered, 8 threads
+./iobench "$MODEL"/out-00069.safetensors 19 64 8 1   # O_DIRECT
 
 # 2) chat; watch the per-turn stats line (tok/s, expert hit-rate, RSS):
-COLI_MODEL=/path/to/glm52_i4 ./coli chat
+COLI_MODEL="$MODEL" ./coli chat
 
 # 3) record expert usage, then pin the hottest experts in your spare RAM:
-STATS=stats.txt ./coli chat
-PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
+COLI_MODEL="$MODEL" STATS=stats.txt ./coli chat
+COLI_MODEL="$MODEL" PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
 
 # 4) quality benchmarks (MMLU/HellaSwag/ARC):
-./coli bench
+COLI_MODEL="$MODEL" ./coli bench
 ```
+
+Report your numbers (machine, `ARCH`, disk, RAM, tok/s, hit-rate) in an issue
+— see the [community benchmarks](#community-benchmarks-measured) below for
+the format other people have used.
 
 **Back-of-envelope predictions** (decode is disk-bound: a cold token costs ~11.4 GB of expert reads; MTP speculation roughly halves the effective cost *once the cache is warm*; RAM turns cold reads into free cache hits):
 
