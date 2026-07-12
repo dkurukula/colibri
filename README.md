@@ -331,7 +331,32 @@ thrashing. Persistent `.coli_usage` remains the long-term signal and is not deca
 
 ## Got a better machine? Try it — here's what to expect
 
-colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), macOS, or **Windows 11 natively (MinGW-w64)**; gcc with OpenMP, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4/NTFS — never a network/9p mount). AVX2 (Haswell 2013+) gets the fastest kernels; **AVX-only CPUs without AVX2/FMA (Sandy/Ivy Bridge, 2011-2012) are also vectorized** (256-bit AVX for the float matmuls, 128-bit SSSE3 for the integer IDOT path) — build with `make ARCH=ivybridge` (or `make portable-avx` for a binary to distribute to any AVX CPU); anything older falls back to scalar C.
+colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), macOS, or **Windows 11 natively (MinGW-w64)**; gcc with OpenMP, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4/NTFS — never a network/9p mount).
+
+### CPU tier: pick the build that matches your vector ISA
+
+| CPU | build | matmul kernel | IDOT kernel |
+|---|---|---|---|
+| Haswell+ (2013+), AVX2/FMA | `make` (`ARCH=native`, default) | AVX2 FMA | avx2 |
+| **Sandy/Ivy Bridge (2011-2012), AVX only** | `make ARCH=ivybridge` | AVX (no FMA) | ssse3 |
+| Anything older (SSE-only) | `make ARCH=x86-64` | scalar | scalar |
+| Skylake-X+ with AVX-512 VNNI | `make` (`ARCH=native` on that CPU) | AVX2 FMA | avx512-vnni |
+
+```bash
+# Ivy Bridge / Sandy Bridge / any AVX-without-AVX2 CPU — same engine, vectorized
+# kernels instead of the scalar fallback (256-bit AVX for the float matmuls,
+# 128-bit SSSE3 for the integer IDOT dot product):
+cd c
+make ARCH=ivybridge && ./glm            # native to *this* machine
+
+# building a binary to hand to another AVX-only machine (no AVX2/FMA assumed):
+make portable-avx                       # ARCH=sandybridge under the hood
+```
+
+`ARCH=native` already autodetects this correctly on real Ivy Bridge/Sandy Bridge
+hardware — `ARCH=ivybridge` only matters when cross-building a binary for a
+different, AVX-only machine. Startup logs the kernel actually picked
+(`idot: avx2` / `idot: ssse3` / `idot: scalar` / `idot: avx512-vnni`).
 
 **How to test it, in order:**
 
