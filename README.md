@@ -64,7 +64,8 @@ Cold starts are heavy on random reads (~11 GB/token), but reads don't meaningful
 benchmarks it: asks you to confirm (or change) the download location, checks
 free disk space *before* touching the network, automatically detects and
 fixes the int4-vs-int8 MTP head gotcha below (no manual file-size checking),
-builds for your CPU, and runs the full benchmark:
+builds for your CPU, checks RAM/swap headroom before it loads the model
+(more below), and runs the full benchmark:
 
 ```bash
 cd c
@@ -74,8 +75,18 @@ make quickstart ARGS="-y"          # non-interactive: accepts every default (~/g
 
 Useful flags via `ARGS="..."`: `--dir PATH` (download location, default
 `~/glm52_i4`), `--arch ivybridge` (AVX-only CPUs — see "CPU tier" below),
-`--skip-download` (model's already there, just build+benchmark). Full list:
+`--ram N` (cap the engine's RAM budget in GB), `--skip-download` (model's
+already there, just build+benchmark). Full list:
 `bash scripts/quickstart.sh --help` or `c/scripts/quickstart.sh`.
+
+**Swap safety gate:** heavy swapping doesn't just slow colibrì down, it can
+make the *whole machine* unresponsive. Before loading the model,
+`make quickstart` checks total RAM, current swap usage, and any `--ram` you
+passed; if total RAM is below the 16 GB floor, swap is already >40% full, or
+`--ram` exceeds what's actually free right now, it explains why and offers a
+choice — `[1]` use a safer auto-computed budget (default, and what `-y`
+applies automatically), `[2]` continue unchanged anyway, or `[3]` abort —
+instead of silently letting the box start thrashing.
 
 ### Manual download
 
@@ -394,7 +405,7 @@ The model itself doesn't care which CPU tier built the engine — it's the same
 | requirement | how much | why |
 |---|---|---|
 | disk (local ext4/NTFS, **not** `/mnt/c` or network/9p) | **~370 GB** for the int4 model, **~400 GB free** while converting locally (deletes each FP8 shard as it goes) | streamed on demand at inference time |
-| RAM | **16 GB floor**, 25 GB+ comfortable | ~9.9 GB dense stays resident; the rest is expert cache — more RAM = higher hit-rate = fewer disk reads/token |
+| RAM | **16 GB floor**, 25 GB+ comfortable | ~9.9 GB dense stays resident; the rest is expert cache — more RAM = higher hit-rate = fewer disk reads/token. Ivy Bridge-era machines are exactly the ones most likely to be RAM-constrained too — `make quickstart`'s swap safety gate (below) catches that before it makes the machine unresponsive. |
 | CPU | any Sandy/Ivy Bridge-class x86-64 (2011+, has AVX) | gets the vectorized AVX+SSSE3 kernels below instead of the scalar fallback |
 
 The single-command path from "Download the model" above already does all of
