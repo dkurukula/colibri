@@ -331,7 +331,7 @@ thrashing. Persistent `.coli_usage` remains the long-term signal and is not deca
 
 ## Got a better machine? Try it — here's what to expect
 
-colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), macOS, or **Windows 11 natively (MinGW-w64)**; gcc with OpenMP, AVX2, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4/NTFS — never a network/9p mount).
+colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), macOS, or **Windows 11 natively (MinGW-w64)**; gcc with OpenMP, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4/NTFS — never a network/9p mount). AVX2 (Haswell 2013+) gets the fastest kernels; **AVX-only CPUs without AVX2/FMA (Sandy/Ivy Bridge, 2011-2012) are also vectorized** (256-bit AVX for the float matmuls, 128-bit SSSE3 for the integer IDOT path) — build with `make ARCH=ivybridge` (or `make portable-avx` for a binary to distribute to any AVX CPU); anything older falls back to scalar C.
 
 **How to test it, in order:**
 

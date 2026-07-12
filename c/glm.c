@@ -37,9 +37,13 @@
 #include <omp.h>
 #include "backend_cuda.h"
 #endif
-#ifdef __AVX2__
-#include <immintrin.h>
-static inline float hsum256(__m256 v){            /* somma orizzontale di 8 float */
+#if defined(__AVX__) || defined(__SSSE3__)
+#include <immintrin.h>                             /* copre AVX2/AVX/SSSE3: incluso solo se uno
+                                                     * dei tre e' attivo, gli intrinsic inutilizzati
+                                                     * restano semplici dichiarazioni non chiamate. */
+#endif
+#if defined(__AVX__)
+static inline float hsum256(__m256 v){            /* somma orizzontale di 8 float (AVX, no AVX2) */
     __m128 lo=_mm256_castps256_ps128(v), hi=_mm256_extractf128_ps(v,1);
     lo=_mm_add_ps(lo,hi); __m128 sh=_mm_movehl_ps(lo,lo); lo=_mm_add_ps(lo,sh);
     sh=_mm_shuffle_ps(lo,lo,1); lo=_mm_add_ss(lo,sh); return _mm_cvtss_f32(lo);
@@ -214,6 +218,15 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
             for(;i+8<=I;i+=8){ __m256i wi=_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(w+i)));
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i), _mm256_cvtepi32_ps(wi), acc); }
             a=hsum256(acc);
+#elif defined(__AVX__)
+            /* Ivy/Sandy Bridge: AVX (256-bit float) c'e', AVX2 (256-bit int) e FMA no.
+             * Converte 8 int8 -> int32 con SSE4.1 in due meta' da 4, poi mul+add AVX. */
+            __m256 acc=_mm256_setzero_ps();
+            for(;i+8<=I;i+=8){ __m128i w8=_mm_loadl_epi64((const __m128i*)(w+i));
+                __m128i wlo=_mm_cvtepi8_epi32(w8), whi=_mm_cvtepi8_epi32(_mm_srli_si128(w8,4));
+                __m256 wf=_mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(wlo)),_mm_cvtepi32_ps(whi),1);
+                acc=_mm256_add_ps(acc,_mm256_mul_ps(_mm256_loadu_ps(xs+i), wf)); }
+            a=hsum256(acc);
 #elif defined(__ARM_NEON)
             float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
             for(;i+8<=I;i+=8){ int16x8_t w16=vmovl_s8(vld1_s8(w+i));
@@ -239,6 +252,21 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+            a=hsum256(acc);
+#elif defined(__AVX__)
+            const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8i=_mm_set1_epi32(8);
+            __m256 acc=_mm256_setzero_ps();
+            for(;i+16<=I;i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));   /* 8 byte=16 nibble */
+                __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                __m128i nib=_mm_unpacklo_epi8(lo,hi);                                       /* 16 nibble in ordine */
+                __m128i n0a=_mm_sub_epi32(_mm_cvtepu8_epi32(nib),b8i);
+                __m128i n0b=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nib,4)),b8i);
+                __m128i n1a=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8i);
+                __m128i n1b=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nib,12)),b8i);
+                __m256 w0=_mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(n0a)),_mm_cvtepi32_ps(n0b),1);
+                __m256 w1=_mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(n1a)),_mm_cvtepi32_ps(n1b),1);
+                acc=_mm256_add_ps(acc,_mm256_mul_ps(_mm256_loadu_ps(xs+i),   w0));
+                acc=_mm256_add_ps(acc,_mm256_mul_ps(_mm256_loadu_ps(xs+i+8), w1)); }
             a=hsum256(acc);
 #elif defined(__ARM_NEON)
             const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
@@ -277,6 +305,23 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
             a=hsum256(acc);
+#elif defined(__AVX__)
+            const __m128i m2=_mm_set1_epi8(0x03); const __m128i b2i=_mm_set1_epi32(2);
+            __m256 acc=_mm256_setzero_ps();
+            for(;i+16<=I;i+=16){ __m128i by=_mm_cvtsi32_si128(*(const int*)(w+(i>>2)));    /* 4 byte=16 valori */
+                __m128i p0=_mm_and_si128(by,m2), p1=_mm_and_si128(_mm_srli_epi16(by,2),m2);
+                __m128i p2=_mm_and_si128(_mm_srli_epi16(by,4),m2), p3=_mm_and_si128(_mm_srli_epi16(by,6),m2);
+                __m128i lo=_mm_unpacklo_epi8(p0,p1), hi=_mm_unpacklo_epi8(p2,p3);
+                __m128i nib=_mm_unpacklo_epi16(lo,hi);                                      /* 16 valori in ordine */
+                __m128i n0a=_mm_sub_epi32(_mm_cvtepu8_epi32(nib),b2i);
+                __m128i n0b=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nib,4)),b2i);
+                __m128i n1a=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nib,8)),b2i);
+                __m128i n1b=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nib,12)),b2i);
+                __m256 w0=_mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(n0a)),_mm_cvtepi32_ps(n0b),1);
+                __m256 w1=_mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(n1a)),_mm_cvtepi32_ps(n1b),1);
+                acc=_mm256_add_ps(acc,_mm256_mul_ps(_mm256_loadu_ps(xs+i),   w0));
+                acc=_mm256_add_ps(acc,_mm256_mul_ps(_mm256_loadu_ps(xs+i+8), w1)); }
+            a=hsum256(acc);
 #elif defined(__ARM_NEON)
             const uint8x8_t m2v=vdup_n_u8(3); const int8x8_t b2v=vdup_n_s8(2);
             float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
@@ -304,6 +349,9 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "avx512-vnni"
 #elif defined(__AVX2__)
 #define IDOT_KERNEL "avx2"
+#elif defined(__SSSE3__)
+#define IDOT_KERNEL "ssse3"        /* AVX senza AVX2 (Sandy/Ivy Bridge): niente int a 256 bit,
+                                    * il dot intero usa comunque SSSE3 a 128 bit (vedi dot_i8i8). */
 #elif defined(__ARM_NEON)
 #define IDOT_KERNEL "neon"
 #else
@@ -329,6 +377,11 @@ static inline int hsum256_i32(__m256i v){
     __m128i lo=_mm256_castsi256_si128(v), hi=_mm256_extracti128_si256(v,1);
     lo=_mm_add_epi32(lo,hi); lo=_mm_hadd_epi32(lo,lo); lo=_mm_hadd_epi32(lo,lo);
     return _mm_cvtsi128_si32(lo);
+}
+#elif defined(__SSSE3__)
+static inline int hsum128_i32(__m128i v){
+    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v);
+    return _mm_cvtsi128_si32(v);
 }
 #endif
 /* dot int8·int8: trucco del segno (|w| unsigned × x·sign(w) signed). Sicuro:
@@ -358,6 +411,17 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
     }
     sum=hsum256_i32(acc);
+#elif defined(__SSSE3__)
+    /* AVX senza AVX2 (Sandy/Ivy Bridge): niente int a 256 bit, stesso trucco del
+     * segno ma a 128 bit/16 byte per iterazione (pmaddubsw/pmaddwd sono SSSE3/SSE2). */
+    __m128i acc=_mm_setzero_si128(); const __m128i ones=_mm_set1_epi16(1);
+    for(;i+16<=I;i+=16){
+        __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i p=_mm_maddubs_epi16(_mm_sign_epi8(wv,wv),_mm_sign_epi8(xv,wv));
+        acc=_mm_add_epi32(acc,_mm_madd_epi16(p,ones));
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__ARM_NEON)
     /* ARM: SDOT nativo se disponibile (Apple Silicon: sempre); altrimenti vmull/vpadal.
      * Stesso bound anti-overflow del trucco AVX2: coppie <= 128*127*2 = 32512 < 32767. */
@@ -414,6 +478,21 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
     }
     sum=hsum256_i32(acc);
+#elif defined(__SSSE3__)
+    /* Stesso schema del ramo AVX2 ma a 128 bit: 8 byte = 16 nibble per iterazione. */
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
+    const __m128i ones=_mm_set1_epi16(1);
+    __m128i acc=_mm_setzero_si128();
+    for(;i+16<=I;i+=16){
+        __m128i by=_mm_loadl_epi64((const __m128i*)(w4+(i>>1)));   /* 8 byte = 16 nibble */
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i nib=_mm_unpacklo_epi8(lo,hi);                        /* 16 nibble in ordine */
+        __m128i wv=_mm_sub_epi8(nib,b8);
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i p=_mm_maddubs_epi16(_mm_sign_epi8(wv,wv),_mm_sign_epi8(xv,wv));
+        acc=_mm_add_epi32(acc,_mm_madd_epi16(p,ones));
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__ARM_NEON)
     const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
     int32x4_t acc=vdupq_n_s32(0);
