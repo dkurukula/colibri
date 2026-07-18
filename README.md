@@ -519,6 +519,11 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 
 Takeaways: with 24 GB of RAM the engine auto-caps the expert cache to 2 slots/layer, so decode stays cold even on a disk 2–2.7× faster than the dev box — **on small-RAM machines the RAM cap, not the disk, is the binding constraint**, exactly as the table above predicts; `--topp 0.7` alone bought a clean 1.6× end-to-end speedup. The M5 Max datapoint lands right on the table's second row: **~1 tok/s of a 744B model on a laptop SSD** — and its 14 GB/s disk shifts the bottleneck back to RAM budget and kernels. The Framework 13 rows are the cache thesis proven end-to-end on one machine: 0.29 → 0.37 tok/s (hit 28% → 66%, speculation finally engaging at 52% acceptance) just by giving the cache its RAM — int8 MTP head + a bigger cap + the learned pin. The cap part is now automatic (cap auto-raise, 2026-07-10). The 9950X pair is the cleanest bottleneck experiment yet — same machine, same history, only the disk swapped: ×5.8 disk bandwidth bought ×2.9 tokens, and the profile **flipped from 66% disk to 57% matmul**. Past ~5 GB/s the disk stops being the story and the CPU (or the CUDA expert tier) becomes it.
 
+| Dell PowerEdge R720 · Linux · Ivy Bridge · 134.6 GB RAM | — | `CAP_RAISE=0 ./coli run --ram 50 --cap 8` | **0.12 tok/s** · expert hit 11.6% · RSS 24.54 GB |
+| Dell PowerEdge R720 · Linux · Ivy Bridge · 134.6 GB RAM | — | `./coli bench --ram 50 --cap 8` | `hellaswag` 30.0% acc / 50.0% acc_norm · `arc_challenge` 70.0% acc / 60.0% acc_norm · `mmlu` 50.0% acc / 50.0% acc_norm · **MEDIA acc_norm 53.3%** · score wall 16137s · `RSS 22.02 GB` · expert hit 1% · 120 requests / 16121.6s (~0.0074 req/s) |
+
+Note: the decode hit-rate above comes from a single generation path, while the score hit-rate comes from the benchmark harness’s one-request-per-answer-option sweep, so the latter is expected to be lower on this host.
+
 ## Quality benchmark — help wanted
 
 We have never measured how much the int4 quantization costs in accuracy — the harness is built and wired, but scoring is one forward per answer option, and on the dev box's ~1 GB/s disk a full run takes the better part of a day. **This is the single most valuable thing a faster machine can contribute.** The code is here and ready; one command runs it end to end (it auto-downloads the datasets on first use):
