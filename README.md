@@ -60,17 +60,51 @@ Cold starts are heavy on random reads (~11 GB/token), but reads don't meaningful
 
 ## Download the model
 
-A pre-converted **GLM-5.2 int4** model for colibrì is available on Hugging Face:
+**Fastest path — one command** downloads the real 744B GLM-5.2 int4 model and
+benchmarks it, handling the fiddly parts automatically:
+
+- confirms (or lets you change) the download location
+- checks free disk space *before* touching the network
+- detects and fixes the int4-vs-int8 MTP head gotcha below (no manual file-size checking)
+- builds for your CPU
+- checks RAM/swap headroom before loading the model (more below)
+- runs the full benchmark
+
+```bash
+cd c
+make quickstart                    # interactive: confirms before downloading anything
+make quickstart ARGS="-y"          # non-interactive: accepts every default (~/glm52_i4)
+```
+
+Useful flags via `ARGS="..."`: `--dir PATH` (download location, default
+`~/glm52_i4`), `--arch ivybridge` (AVX-only CPUs — see "CPU tier" below),
+`--ram N` (cap the engine's RAM budget in GB), `--skip-download` (model's
+already there, just build+benchmark). See the full list with
+`bash scripts/quickstart.sh --help`, or read `c/scripts/quickstart.sh` directly.
+
+**Swap safety gate:** heavy swapping doesn't just slow colibrì down, it can
+make the *whole machine* unresponsive. Before loading the model,
+`make quickstart` checks total RAM, current swap usage, and any `--ram` you
+passed. If total RAM is below the 16 GB floor, swap is already >40% full, or
+`--ram` exceeds what's actually free right now, it explains why and offers a
+choice instead of silently letting the box start thrashing: `[1]` use a
+safer auto-computed budget (the default, and what `-y` applies
+automatically), `[2]` continue unchanged anyway, or `[3]` abort.
+
+### Manual download
+
+A pre-converted **GLM-5.2 int4** model is also available directly on Hugging Face:
 
 **https://huggingface.co/jlnsrk/GLM-5.2-colibri-int4**
 
-If the MTP files there are still the int4 head (see [#8](https://github.com/JustVugg/colibri/issues/8) — sizes `1765523544/2686077736/536747200` = int4, unusable), grab the **int8 MTP heads** from the community clone by matey-0: **https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
-
-Download the repository and point `COLI_MODEL` to its directory:
-
 ```bash
-COLI_MODEL=/path/to/GLM-5.2-colibri-int4 ./coli chat
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download jlnsrk/GLM-5.2-colibri-int4 --local-dir ~/glm52_i4
+
+COLI_MODEL=~/glm52_i4 ./coli chat
 ```
+
+If the MTP files there are still the int4 head (see [#8](https://github.com/JustVugg/colibri/issues/8) — sizes `1765523544/2686077736/536747200` = int4, unusable), grab the **int8 MTP heads** from the community clone by matey-0: **https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp** (`make quickstart` above checks for and fixes this automatically).
 
 This skips the FP8 → int4 conversion step entirely.
 
@@ -331,28 +365,133 @@ thrashing. Persistent `.coli_usage` remains the long-term signal and is not deca
 
 ## Got a better machine? Try it — here's what to expect
 
-colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), macOS, or **Windows 11 natively (MinGW-w64)**; gcc with OpenMP, AVX2, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4/NTFS — never a network/9p mount).
+colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), macOS, or **Windows 11 natively (MinGW-w64)**; gcc with OpenMP, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4/NTFS — never a network/9p mount).
 
-**How to test it, in order:**
+### CPU tier: pick the build that matches your vector ISA
+
+> **Fork note:** this repository is a fork of [JustVugg/colibri](https://github.com/JustVugg/colibri).
+> Upstream colibrì assumes an AVX2 CPU (Haswell, 2013+) and falls back to plain
+> scalar C otherwise — that's a deliberate upstream choice, not a bug, and it is
+> **not** something the original author designed around AVX-only hardware for.
+> This fork adds the AVX-only code path below (Sandy/Ivy Bridge, 2011-2012:
+> vectorized AVX float matmuls + SSSE3 integer dot product, no AVX2/FMA) so the
+> engine also runs vectorized — not scalar — on that older hardware.
+
+| CPU | build | matmul kernel | IDOT kernel |
+|---|---|---|---|
+| Haswell+ (2013+), AVX2/FMA | `make` (`ARCH=native`, default) | AVX2 FMA | avx2 |
+| **Sandy/Ivy Bridge (2011-2012), AVX only** | `make ARCH=ivybridge` | AVX (no FMA) | ssse3 |
+| Anything older (SSE-only) | `make ARCH=x86-64` | scalar | scalar |
+| Skylake-X+ with AVX-512 VNNI | `make` (`ARCH=native` on that CPU) | AVX2 FMA | avx512-vnni |
 
 ```bash
-cd c && ./setup.sh                 # build + architecture self-test (expects 32/32)
+# Ivy Bridge / Sandy Bridge / any AVX-without-AVX2 CPU — same engine, vectorized
+# kernels instead of the scalar fallback (256-bit AVX for the float matmuls,
+# 128-bit SSSE3 for the integer IDOT dot product):
+cd c
+make ARCH=ivybridge && ./glm            # native to *this* machine
+
+# building a binary to hand to another AVX-only machine (no AVX2/FMA assumed):
+make portable-avx                       # ARCH=sandybridge under the hood
+```
+
+`ARCH=native` already autodetects this correctly on real Ivy Bridge/Sandy Bridge
+hardware — `ARCH=ivybridge` only matters when cross-building a binary for a
+different, AVX-only machine. Startup logs the kernel actually picked
+(`idot: avx2` / `idot: ssse3` / `idot: scalar` / `idot: avx512-vnni`).
+
+### Running GLM-5.2 on Ivy Bridge hardware
+
+The model itself doesn't care which CPU tier built the engine — it's the same
+744B GLM-5.2 int4 checkpoint either way. What you need, concretely:
+
+| requirement | how much | why |
+|---|---|---|
+| disk (local ext4/NTFS, **not** `/mnt/c` or network/9p) | **~370 GB** for the int4 model, **~400 GB free** while converting locally (deletes each FP8 shard as it goes) | streamed on demand at inference time |
+| RAM | **16 GB floor**, 25 GB+ comfortable | ~9.9 GB dense stays resident; the rest is expert cache — more RAM = higher hit-rate = fewer disk reads/token. Ivy Bridge-era machines are exactly the ones most likely to be RAM-constrained too — `make quickstart`'s swap safety gate (below) catches that before it makes the machine unresponsive. |
+| CPU | any Sandy/Ivy Bridge-class x86-64 (2011+, has AVX) | gets the vectorized AVX+SSSE3 kernels below instead of the scalar fallback |
+
+The single-command path from "Download the model" above already does all of
+this correctly on Ivy Bridge — just tell it which `ARCH` to build:
+
+```bash
+cd c
+make quickstart ARGS="--arch ivybridge -y"    # download + build (AVX-only) + benchmark, one shot
+```
+
+Or step by step, if you'd rather see/control each part:
+
+```bash
+cd c
+make ARCH=ivybridge                     # AVX-only build (no AVX2/FMA required)
+
+# get the model — pick ONE (default path ~/glm52_i4; override if you keep models elsewhere):
+pip install -U "huggingface_hub[cli]"                              # (a) pre-converted, skips conversion
+huggingface-cli download jlnsrk/GLM-5.2-colibri-int4 --local-dir ~/glm52_i4
+# — or —
+./coli convert --model ~/glm52_i4                                  # (b) convert FP8 yourself, needs ~400 GB free
+
+# run it — RAM budget, expert cache and MTP are all detected automatically:
+COLI_MODEL=~/glm52_i4 ./coli chat --ram 16     # set --ram to whatever you actually have free
+```
+
+Expect it to be **disk-bound, not CPU-bound** at this scale (see the
+back-of-envelope table below). The AVX kernels mainly matter for the matmul
+share of that time — roughly 2× the scalar fallback on int8, ~6× on int4
+(see the reproducible benchmark table above) — and for keeping the engine
+off the "illegal instruction" crash an AVX2-only build would hit on this
+hardware.
+
+Reproduce this: `make bench-cpu-tiers` builds all four tiers, runs real forward
+passes (prefill + autoregressive decode) against generated tiny/medium
+random-weight fixtures, asserts every tier agrees, and prints the kernel
+timing table above (see `c/scripts/bench_cpu_tiers.sh`; one-time need for
+fixture generation: `pip install torch transformers safetensors`). With
+`qemu-user-static` installed it additionally proves the Ivy Bridge build
+actually runs under an emulated Ivy Bridge CPU while an AVX2 build SIGILLs
+under the same CPU model.
+
+### Benchmark the full model
+
+`make quickstart` (see "Download the model" above) already downloads the
+model *and* runs this benchmark in one shot — this section is for benchmarking
+a model you already have, or for running each step individually with more
+control (e.g. a higher `--limit` on the quality suite).
+
+One copy-paste block, four steps, using the **real 744B GLM-5.2 model** (not a
+fixture) end to end: build for your CPU, measure your disk the way the engine
+actually reads it, measure decode speed, then run the quality suite. Set
+`MODEL` and `ARCH` once at the top and the rest is unchanged for any machine
+— `ARCH=ivybridge` (or `sandybridge`) if that's your CPU tier, `native`
+otherwise.
+
+```bash
+cd c
+MODEL=~/glm52_i4                             # your downloaded/converted int4 model (see "Download the model" above)
+ARCH=native                                  # or: ivybridge / sandybridge / x86-64-v3
+
+# 0) build + architecture self-test (expects 32/32):
+ARCH="$ARCH" ./setup.sh
 
 # 1) measure YOUR disk the way the engine uses it (parallel 19 MB random reads):
 gcc -O2 -fopenmp iobench.c -o iobench
-./iobench /path/to/glm52_i4/out-00069.safetensors 19 64 8 0   # buffered, 8 threads
-./iobench /path/to/glm52_i4/out-00069.safetensors 19 64 8 1   # O_DIRECT
+./iobench "$MODEL"/out-00069.safetensors 19 64 8 0   # buffered, 8 threads
+./iobench "$MODEL"/out-00069.safetensors 19 64 8 1   # O_DIRECT
 
 # 2) chat; watch the per-turn stats line (tok/s, expert hit-rate, RSS):
-COLI_MODEL=/path/to/glm52_i4 ./coli chat
+COLI_MODEL="$MODEL" ./coli chat
 
 # 3) record expert usage, then pin the hottest experts in your spare RAM:
-STATS=stats.txt ./coli chat
-PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
+COLI_MODEL="$MODEL" STATS=stats.txt ./coli chat
+COLI_MODEL="$MODEL" PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
 
 # 4) quality benchmarks (MMLU/HellaSwag/ARC):
-./coli bench
+COLI_MODEL="$MODEL" ./coli bench
 ```
+
+Report your numbers (machine, `ARCH`, disk, RAM, tok/s, hit-rate) in an issue
+— see the [community benchmarks](#community-benchmarks-measured) below for
+the format other people have used.
 
 **Back-of-envelope predictions** (decode is disk-bound: a cold token costs ~11.4 GB of expert reads; MTP speculation roughly halves the effective cost *once the cache is warm*; RAM turns cold reads into free cache hits):
 
@@ -381,8 +520,12 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 | 〃 same machine, model moved to a Samsung 9100 PRO PCIe 5.0 ([#31](https://github.com/JustVugg/colibri/issues/31)) | **8.81 GB/s** O_DIRECT | 〃 (usage history retained) | **0.28 tok/s** · hit 57% · profile flips: 32% disk / **57% matmul** |
 | Ryzen AI Max+ 395 (Framework Desktop) · Ubuntu · 128 GB LPDDR5x · Intel Optane 905p PCIe 3.0 ([#39](https://github.com/JustVugg/colibri/issues/39)) | 3.27 GB/s buffered | int8 MTP head · fresh history (pure LRU, auto-raised cap 65) | 0.16 tok/s · hit 57% · profile 49% disk / 47% matmul |
 | 〃 five runs later — learned pin 47.6 GB ([#39](https://github.com/JustVugg/colibri/issues/39)) | 〃 | `--temp 0.7 --topp 0.7` | **0.40 tok/s** · hit 71% · fastest non-Apple datapoint |
+| **Dell PowerEdge R720 · Linux · Ivy Bridge (AVX, no AVX2/FMA) · 134.6 GB RAM** | — | `CAP_RAISE=0 ./coli run --ram 50 --cap 8` | 0.12 tok/s · expert hit 11.6% · RSS 24.54 GB |
+| 〃 quality benchmark | — | `./coli bench --ram 50 --cap 8` | `hellaswag` 30.0% acc / 50.0% acc_norm · `arc_challenge` 70.0% acc / 60.0% acc_norm · `mmlu` 50.0% acc / 50.0% acc_norm · **MEDIA acc_norm 53.3%** · score wall 16137s · RSS 22.02 GB · expert hit 1% · 120 requests / 16121.6s (~0.0074 req/s) |
 
 Takeaways: with 24 GB of RAM the engine auto-caps the expert cache to 2 slots/layer, so decode stays cold even on a disk 2–2.7× faster than the dev box — **on small-RAM machines the RAM cap, not the disk, is the binding constraint**, exactly as the table above predicts; `--topp 0.7` alone bought a clean 1.6× end-to-end speedup. The M5 Max datapoint lands right on the table's second row: **~1 tok/s of a 744B model on a laptop SSD** — and its 14 GB/s disk shifts the bottleneck back to RAM budget and kernels. The Framework 13 rows are the cache thesis proven end-to-end on one machine: 0.29 → 0.37 tok/s (hit 28% → 66%, speculation finally engaging at 52% acceptance) just by giving the cache its RAM — int8 MTP head + a bigger cap + the learned pin. The cap part is now automatic (cap auto-raise, 2026-07-10). The 9950X pair is the cleanest bottleneck experiment yet — same machine, same history, only the disk swapped: ×5.8 disk bandwidth bought ×2.9 tokens, and the profile **flipped from 66% disk to 57% matmul**. Past ~5 GB/s the disk stops being the story and the CPU (or the CUDA expert tier) becomes it.
+
+The R720 rows are the first real-hardware confirmation of this fork's AVX-only kernels (built with `ARCH=ivybridge`, `idot: ssse3`) on genuine Ivy Bridge silicon — see `Containerfile.r720` for the exact reproducible setup (`make quickstart ARGS='-y --dir /model --arch ivybridge --ram 48'`). 134 GB of RAM couldn't lift the 1% expert hit-rate on the quality run, because the benchmark harness sweeps one forward per answer option — a different access pattern from decode's single generation path, so its low hit-rate isn't comparable to the decode row above it. At 0.12 tok/s decode, this machine is disk-bound rather than CPU-bound, same as the Ivy Bridge section above predicts — its ~13-year-old spinning/SAS storage, not the AVX kernels, is the ceiling here.
 
 ## Quality benchmark — help wanted
 

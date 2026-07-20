@@ -1,4 +1,4 @@
-.PHONY: all glm portable test check cuda-test clean
+.PHONY: all glm portable portable-avx test check cuda-test clean bench-cpu-tiers quickstart
 
-all glm portable test check cuda-test clean:
+all glm portable portable-avx test check cuda-test clean bench-cpu-tiers quickstart:
 	$(MAKE) -C c $@

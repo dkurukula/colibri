@@ -37,7 +37,11 @@ else
 CC      = gcc
 # ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
 # ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
-# ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
+# ARCH=ivybridge (o sandybridge/x86-64-v2) -> AVX senza AVX2/FMA (Sandy/Ivy Bridge,
+#   2011-2012): i kernel matmul_q/i4/i2 e il dot intero (IDOT) usano comunque i
+#   percorsi vettoriali (AVX a 256 bit per i float, SSSE3 a 128 bit per l'intero)
+#   invece di ricadere sullo scalare puro.
+# ARCH=x86-64 -> massima compatibilita' (niente AVX/SSSE3: usa il path scalare di fallback).
 ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp
@@ -91,6 +95,11 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h
 portable:
 	$(MAKE) glm$(EXE) ARCH=x86-64-v3
 
+# come 'portable', ma per CPU AVX senza AVX2/FMA (Sandy/Ivy Bridge e successive):
+# stessi kernel vettoriali (AVX float + SSSE3 intero), niente istruzioni AVX2/FMA.
+portable-avx:
+	$(MAKE) glm$(EXE) ARCH=sandybridge
+
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
@@ -124,4 +133,19 @@ clean:
 	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test portable test-c test-python test check clean
+# Reproducible correctness + benchmark harness for the CPU vector-ISA tiers
+# (AVX-512 / AVX2+FMA / AVX-only+SSSE3 "Ivy Bridge" / scalar). Builds all four,
+# checks they agree, times the quantized matmul kernel. Needs (one-time, only
+# to generate the fixtures if missing): pip install torch transformers safetensors
+bench-cpu-tiers:
+	bash scripts/bench_cpu_tiers.sh
+
+# One command: download the real 744B GLM-5.2 int4 model and benchmark it.
+# Asks for/confirms a download location, checks free disk space first, fixes
+# the known int4-vs-int8 MTP head gotcha automatically, builds for this CPU,
+# then runs the disk/decode/quality benchmark. Pass ARGS="..." for flags, e.g:
+#   make quickstart ARGS="-y --dir /data/glm52 --arch ivybridge"
+quickstart:
+	bash scripts/quickstart.sh $(ARGS)
+
+.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean bench-cpu-tiers quickstart

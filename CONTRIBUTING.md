@@ -22,5 +22,22 @@ CUDA changes should additionally be checked on a CUDA-capable Linux host:
 make -C c cuda-test CUDA_ARCH=native
 ```
 
+Kernel/SIMD changes (anything touching the `__AVX2__`/`__AVX__`/`__SSSE3__`/
+`__ARM_NEON` branches in `glm.c`) should additionally be checked with:
+
+```sh
+make bench-cpu-tiers
+```
+
+This builds `native`/`x86-64-v3`/`ivybridge`/`x86-64` (AVX-512, AVX2+FMA,
+AVX-only+SSSE3, scalar), asserts all four agree on real forward passes against
+the project's own tiny/medium random-weight oracles (generated on first run;
+needs `pip install torch transformers safetensors`), and times the quantized
+matmul kernel per tier. If `qemu-user-static` is installed it also runs an
+extra check under an emulated Ivy Bridge CPU. See
+`c/scripts/bench_cpu_tiers.sh` for details, including why a same-match-rate,
+different-specific-token result on int4 is a pass (floating-point
+non-associativity on an already-wrong argmax tie), not a failure.
+
 Benchmark reports should include the commit, exact commands, hardware and
 storage details, warm-up policy, run count, and median throughput.
