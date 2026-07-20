@@ -32,6 +32,7 @@
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
+#include "repin.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #ifdef COLI_CUDA
 #include <omp.h>
@@ -1985,6 +1986,18 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
  * persistent .coli_usage intact while adapting to the current workload. */
 static int g_repin=0;
 static uint64_t g_last_repin=0;
+/* LOAD-AWARE GATE (arXiv:2607.10183 "ATSInfer", Alg. 3): REPIN=n used to trigger the swap
+ * pass unconditionally every n emitted tokens, blind to whether anything actually changed —
+ * exactly the "load-unaware scheduling" gap that paper identifies (fixed/periodic policies
+ * degrade under transient disk/CPU contention or thermal throttling, see colibri's own
+ * SSD-thermals note). We keep REPIN=n as the minimum check interval (their tau) but only
+ * pay for the swap (disk reads + optional VRAM re-upload) when the measured tok/s has
+ * drifted from a rolling baseline by more than REPIN_EPS (their epsilon; default 0.15,
+ * their own chosen value) — a real degradation, not run-to-run noise. Below that, the
+ * baseline itself still tracks slow drift via EMA so a real trend still gets caught. */
+static double g_repin_eps=0.15;
+static double g_repin_baseline=0;
+static int g_repin_have_baseline=0;
 typedef struct { long gain; int l, slot, eid; } RepinCand;
 static int repin_pick(Model *m, RepinCand *out, int maxc){
     Cfg *c=&m->c; int nb=0;
@@ -2000,10 +2013,11 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
     }
     return nb;
 }
-static void repin_pass(Model *m){
-    if(g_repin<=0) return;
-    if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
-    g_last_repin = m->n_emit;
+/* toks_per_s: this turn's measured decode throughput (already computed by every call site
+ * for the STAT line) — the TPOT-equivalent load signal repin_gate uses to decide whether
+ * re-pinning is actually worth its disk cost right now. */
+static void repin_pass(Model *m, double toks_per_s){
+    if(!repin_gate(&g_last_repin,m->n_emit,g_repin,toks_per_s,g_repin_eps,&g_repin_baseline,&g_repin_have_baseline)) return;
     RepinCand cd[4]; int nb=repin_pick(m,cd,4);
     for(int b=0;b<nb;b++){
         ESlot *s=&m->pin[cd[b].l][cd[b].slot];
@@ -2184,7 +2198,7 @@ static void run_serve(Model *m, const char *snap){
             double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
             printf("\n\x01\x01" "END" "\x01\x01\n");
             printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
-            fflush(stdout); kv_disk_append(m,hist,len); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
+            fflush(stdout); kv_disk_append(m,hist,len); repin_pass(m,prod/tdt); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         /* API mode: an exact, length-prefixed prompt. Unlike the interactive
          * line protocol this accepts newlines. The tokenized prompt is matched
@@ -2265,6 +2279,7 @@ static void run_serve(Model *m, const char *snap){
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
+        repin_pass(m,prod/tdt);          /* RFC: re-pin a caldo — mancava su questo path / was missing on this path */
     }
     free(line); free(buf);
     usage_save(m);
@@ -2591,6 +2606,7 @@ int main(int argc, char **argv){
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
+    g_repin_eps = getenv("REPIN_EPS")?atof(getenv("REPIN_EPS")):0.15;  /* load-aware gate: skip the swap unless measured tok/s drifted by this fraction (0=always swap, legacy behavior) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */

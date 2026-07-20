@@ -360,6 +360,14 @@ session heat map replaces cold pinned experts with hotter streamed experts. Repl
 loads the expert from disk into the existing RAM slot; GPU-backed slots immediately
 refresh the same VRAM tier budget. A 25% hysteresis and a four-swap limit prevent tier
 thrashing. Persistent `.coli_usage` remains the long-term signal and is not decayed.
+`--repin N` now also gates the swap on measured load, not just token count (concept from
+["Automated Tensor Scheduling for Hybrid CPU-GPU LLM Inference on Consumer Devices"](https://arxiv.org/abs/2607.10183),
+arXiv:2607.10183 — its Algorithm 3): N is the minimum check interval, but the engine only
+pays the disk cost of a swap when this turn's measured tok/s has drifted from a rolling
+baseline by more than `REPIN_EPS` (default 0.15, the paper's own chosen threshold) —
+otherwise it just tracks the drift and rechecks later. This also fixes the swap pass
+never firing on ordinary (non-continuation) turns. `REPIN_EPS=0` restores the old
+unconditional-every-N-tokens behavior.
 
 **Conversations reopen warm** (`.coli_kv`, since 2026-07-10): `coli chat` persists the compressed MLA KV-cache to disk after every turn (~182 KB/token, appended incrementally, crash-safe). Close the chat, reopen it tomorrow — the model still remembers the whole conversation and **zero re-prefill happens**: validated byte-identical to an uninterrupted session. `:reset` clears it, `KVSAVE=0` disables it.
 
