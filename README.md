@@ -61,11 +61,14 @@ Cold starts are heavy on random reads (~11 GB/token), but reads don't meaningful
 ## Download the model
 
 **Fastest path — one command** downloads the real 744B GLM-5.2 int4 model and
-benchmarks it: asks you to confirm (or change) the download location, checks
-free disk space *before* touching the network, automatically detects and
-fixes the int4-vs-int8 MTP head gotcha below (no manual file-size checking),
-builds for your CPU, checks RAM/swap headroom before it loads the model
-(more below), and runs the full benchmark:
+benchmarks it, handling the fiddly parts automatically:
+
+- confirms (or lets you change) the download location
+- checks free disk space *before* touching the network
+- detects and fixes the int4-vs-int8 MTP head gotcha below (no manual file-size checking)
+- builds for your CPU
+- checks RAM/swap headroom before loading the model (more below)
+- runs the full benchmark
 
 ```bash
 cd c
@@ -76,17 +79,17 @@ make quickstart ARGS="-y"          # non-interactive: accepts every default (~/g
 Useful flags via `ARGS="..."`: `--dir PATH` (download location, default
 `~/glm52_i4`), `--arch ivybridge` (AVX-only CPUs — see "CPU tier" below),
 `--ram N` (cap the engine's RAM budget in GB), `--skip-download` (model's
-already there, just build+benchmark). Full list:
-`bash scripts/quickstart.sh --help` or `c/scripts/quickstart.sh`.
+already there, just build+benchmark). See the full list with
+`bash scripts/quickstart.sh --help`, or read `c/scripts/quickstart.sh` directly.
 
 **Swap safety gate:** heavy swapping doesn't just slow colibrì down, it can
 make the *whole machine* unresponsive. Before loading the model,
 `make quickstart` checks total RAM, current swap usage, and any `--ram` you
-passed; if total RAM is below the 16 GB floor, swap is already >40% full, or
+passed. If total RAM is below the 16 GB floor, swap is already >40% full, or
 `--ram` exceeds what's actually free right now, it explains why and offers a
-choice — `[1]` use a safer auto-computed budget (default, and what `-y`
-applies automatically), `[2]` continue unchanged anyway, or `[3]` abort —
-instead of silently letting the box start thrashing.
+choice instead of silently letting the box start thrashing: `[1]` use a
+safer auto-computed budget (the default, and what `-y` applies
+automatically), `[2]` continue unchanged anyway, or `[3]` abort.
 
 ### Manual download
 
@@ -432,11 +435,12 @@ huggingface-cli download jlnsrk/GLM-5.2-colibri-int4 --local-dir ~/glm52_i4
 COLI_MODEL=~/glm52_i4 ./coli chat --ram 16     # set --ram to whatever you actually have free
 ```
 
-Expect it to be **disk-bound, not CPU-bound**, at this scale (see the
-back-of-envelope table below) — the AVX kernels mainly matter for the matmul
-share of that time (roughly 2× the scalar fallback on int8, ~6× on int4; see
-the reproducible benchmark table above) and for keeping the engine off the
-"illegal instruction" crash an AVX2-only build would hit on this hardware.
+Expect it to be **disk-bound, not CPU-bound** at this scale (see the
+back-of-envelope table below). The AVX kernels mainly matter for the matmul
+share of that time — roughly 2× the scalar fallback on int8, ~6× on int4
+(see the reproducible benchmark table above) — and for keeping the engine
+off the "illegal instruction" crash an AVX2-only build would hit on this
+hardware.
 
 Reproduce this: `make bench-cpu-tiers` builds all four tiers, runs real forward
 passes (prefill + autoregressive decode) against generated tiny/medium
@@ -516,13 +520,12 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 | 〃 same machine, model moved to a Samsung 9100 PRO PCIe 5.0 ([#31](https://github.com/JustVugg/colibri/issues/31)) | **8.81 GB/s** O_DIRECT | 〃 (usage history retained) | **0.28 tok/s** · hit 57% · profile flips: 32% disk / **57% matmul** |
 | Ryzen AI Max+ 395 (Framework Desktop) · Ubuntu · 128 GB LPDDR5x · Intel Optane 905p PCIe 3.0 ([#39](https://github.com/JustVugg/colibri/issues/39)) | 3.27 GB/s buffered | int8 MTP head · fresh history (pure LRU, auto-raised cap 65) | 0.16 tok/s · hit 57% · profile 49% disk / 47% matmul |
 | 〃 five runs later — learned pin 47.6 GB ([#39](https://github.com/JustVugg/colibri/issues/39)) | 〃 | `--temp 0.7 --topp 0.7` | **0.40 tok/s** · hit 71% · fastest non-Apple datapoint |
+| **Dell PowerEdge R720 · Linux · Ivy Bridge (AVX, no AVX2/FMA) · 134.6 GB RAM** | — | `CAP_RAISE=0 ./coli run --ram 50 --cap 8` | 0.12 tok/s · expert hit 11.6% · RSS 24.54 GB |
+| 〃 quality benchmark | — | `./coli bench --ram 50 --cap 8` | `hellaswag` 30.0% acc / 50.0% acc_norm · `arc_challenge` 70.0% acc / 60.0% acc_norm · `mmlu` 50.0% acc / 50.0% acc_norm · **MEDIA acc_norm 53.3%** · score wall 16137s · RSS 22.02 GB · expert hit 1% · 120 requests / 16121.6s (~0.0074 req/s) |
 
 Takeaways: with 24 GB of RAM the engine auto-caps the expert cache to 2 slots/layer, so decode stays cold even on a disk 2–2.7× faster than the dev box — **on small-RAM machines the RAM cap, not the disk, is the binding constraint**, exactly as the table above predicts; `--topp 0.7` alone bought a clean 1.6× end-to-end speedup. The M5 Max datapoint lands right on the table's second row: **~1 tok/s of a 744B model on a laptop SSD** — and its 14 GB/s disk shifts the bottleneck back to RAM budget and kernels. The Framework 13 rows are the cache thesis proven end-to-end on one machine: 0.29 → 0.37 tok/s (hit 28% → 66%, speculation finally engaging at 52% acceptance) just by giving the cache its RAM — int8 MTP head + a bigger cap + the learned pin. The cap part is now automatic (cap auto-raise, 2026-07-10). The 9950X pair is the cleanest bottleneck experiment yet — same machine, same history, only the disk swapped: ×5.8 disk bandwidth bought ×2.9 tokens, and the profile **flipped from 66% disk to 57% matmul**. Past ~5 GB/s the disk stops being the story and the CPU (or the CUDA expert tier) becomes it.
 
-| Dell PowerEdge R720 · Linux · Ivy Bridge · 134.6 GB RAM | — | `CAP_RAISE=0 ./coli run --ram 50 --cap 8` | **0.12 tok/s** · expert hit 11.6% · RSS 24.54 GB |
-| Dell PowerEdge R720 · Linux · Ivy Bridge · 134.6 GB RAM | — | `./coli bench --ram 50 --cap 8` | `hellaswag` 30.0% acc / 50.0% acc_norm · `arc_challenge` 70.0% acc / 60.0% acc_norm · `mmlu` 50.0% acc / 50.0% acc_norm · **MEDIA acc_norm 53.3%** · score wall 16137s · `RSS 22.02 GB` · expert hit 1% · 120 requests / 16121.6s (~0.0074 req/s) |
-
-Note: the decode hit-rate above comes from a single generation path, while the score hit-rate comes from the benchmark harness’s one-request-per-answer-option sweep, so the latter is expected to be lower on this host.
+The R720 rows are the first real-hardware confirmation of this fork's AVX-only kernels (built with `ARCH=ivybridge`, `idot: ssse3`) on genuine Ivy Bridge silicon — see `Containerfile.r720` for the exact reproducible setup (`make quickstart ARGS='-y --dir /model --arch ivybridge --ram 48'`). 134 GB of RAM couldn't lift the 1% expert hit-rate on the quality run, because the benchmark harness sweeps one forward per answer option — a different access pattern from decode's single generation path, so its low hit-rate isn't comparable to the decode row above it. At 0.12 tok/s decode, this machine is disk-bound rather than CPU-bound, same as the Ivy Bridge section above predicts — its ~13-year-old spinning/SAS storage, not the AVX kernels, is the ceiling here.
 
 ## Quality benchmark — help wanted
 
