@@ -366,8 +366,14 @@ arXiv:2607.10183 — its Algorithm 3): N is the minimum check interval, but the 
 pays the disk cost of a swap when this turn's measured tok/s has drifted from a rolling
 baseline by more than `REPIN_EPS` (default 0.15, the paper's own chosen threshold) —
 otherwise it just tracks the drift and rechecks later. This also fixes the swap pass
-never firing on ordinary (non-continuation) turns. `REPIN_EPS=0` restores the old
-unconditional-every-N-tokens behavior.
+never firing on ordinary (non-continuation) turns — expect up to a few hundred ms of
+disk-bound latency on the turn that triggers a swap, exactly as `--repin` always
+documented, now actually happening for normal chat instead of only the rare truncated-
+response continuation. `REPIN_EPS<=0` restores the old unconditional-every-N-tokens
+behavior. The baseline needs two consistent readings before it's trusted (a single noisy
+first sample shouldn't anchor every future check), so the earliest possible swap moves
+from N tokens to roughly 2N; each `--kv-slots` conversation tracks its own baseline, so
+one slot's normal throughput is never misread as a regression relative to another's.
 
 **Conversations reopen warm** (`.coli_kv`, since 2026-07-10): `coli chat` persists the compressed MLA KV-cache to disk after every turn (~182 KB/token, appended incrementally, crash-safe). Close the chat, reopen it tomorrow — the model still remembers the whole conversation and **zero re-prefill happens**: validated byte-identical to an uninterrupted session. `:reset` clears it, `KVSAVE=0` disables it.
 
