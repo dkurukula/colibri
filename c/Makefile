@@ -143,6 +143,14 @@ clean:
 bench-cpu-tiers:
 	bash scripts/bench_cpu_tiers.sh
 
+# Benchmark the load-aware live re-pin gate (arXiv:2607.10183 "ATSInfer" Alg. 3):
+# REPIN_EPS=0 (legacy, unconditional swap every N tokens) vs REPIN_EPS=0.15
+# (load-aware, only swaps on a real throughput deviation), same token sequence,
+# reports the wasted-disk-I/O-swap reduction. Needs (one-time, only to generate
+# the fixture if missing): pip install torch transformers safetensors
+bench-repin:
+	bash scripts/bench_repin.sh
+
 # One command: download the real 744B GLM-5.2 int4 model and benchmark it.
 # Asks for/confirms a download location, checks free disk space first, fixes
 # the known int4-vs-int8 MTP head gotcha automatically, builds for this CPU,
@@ -151,4 +159,4 @@ bench-cpu-tiers:
 quickstart:
 	bash scripts/quickstart.sh $(ARGS)
 
-.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean bench-cpu-tiers quickstart
+.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean bench-cpu-tiers bench-repin quickstart

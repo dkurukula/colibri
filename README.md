@@ -375,6 +375,26 @@ first sample shouldn't anchor every future check), so the earliest possible swap
 from N tokens to roughly 2N; each `--kv-slots` conversation tracks its own baseline, so
 one slot's normal throughput is never misread as a regression relative to another's.
 
+Reproduce the swap-count reduction: `make bench-repin` (needs, one-time,
+`pip install torch transformers safetensors` to generate a small local fixture — no
+download of the real model). It replays the same deterministic token sequence twice —
+once with `REPIN_EPS=0` (legacy, unconditional swap every N tokens) and once with
+`REPIN_EPS=0.15` (load-aware) — through the exact gate code chat/API turns use, and
+reports how many of the fixed-size windows actually paid a disk-read swap:
+
+```
+| REPIN_EPS | windows swapped (median of 5) |
+|---|---|
+| 0    (legacy)     | 4/30 |
+| 0.15 (load-aware) | 1/30 |
+
+load-aware gate avoided 75% of the disk-I/O swaps legacy paid on the identical token sequence
+```
+
+(Numbers are from the small benchmark fixture on this repo's dev machine, not the real
+744B model — see `c/scripts/bench_repin.sh` for the tunables and the full-model
+equivalent under "Benchmark the full model" below.)
+
 **Conversations reopen warm** (`.coli_kv`, since 2026-07-10): `coli chat` persists the compressed MLA KV-cache to disk after every turn (~182 KB/token, appended incrementally, crash-safe). Close the chat, reopen it tomorrow — the model still remembers the whole conversation and **zero re-prefill happens**: validated byte-identical to an uninterrupted session. `:reset` clears it, `KVSAVE=0` disables it.
 
 ## Got a better machine? Try it — here's what to expect
