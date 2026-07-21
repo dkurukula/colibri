@@ -151,6 +151,15 @@ bench-cpu-tiers:
 bench-repin:
 	bash scripts/bench_repin.sh
 
+# Verify the engine loads and runs a REAL GLM-5.2 checkpoint (real config, real
+# tokenizer, real int4/int8 weights) end to end, and that the AVX-only Ivy Bridge
+# build produces byte-identical output to AVX2/AVX-512 on those same real weights.
+# Downloads a few GB (the dense-resident prefix only, not the full 370 GB model) —
+# needs network. Set QEMU=1 to also cross-check under real -cpu IvyBridge emulation
+# (slow: ~15 min on real weights). See scripts/verify_real_model.sh for tunables.
+verify-real-model:
+	bash scripts/verify_real_model.sh
+
 # One command: download the real 744B GLM-5.2 int4 model and benchmark it.
 # Asks for/confirms a download location, checks free disk space first, fixes
 # the known int4-vs-int8 MTP head gotcha automatically, builds for this CPU,
@@ -159,4 +168,4 @@ bench-repin:
 quickstart:
 	bash scripts/quickstart.sh $(ARGS)
 
-.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean bench-cpu-tiers bench-repin quickstart
+.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean bench-cpu-tiers bench-repin verify-real-model quickstart

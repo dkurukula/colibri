@@ -485,6 +485,17 @@ fixture generation: `pip install torch transformers safetensors`). With
 actually runs under an emulated Ivy Bridge CPU while an AVX2 build SIGILLs
 under the same CPU model.
 
+That's all against synthetic random-weight fixtures, for speed. To check
+against the REAL model instead: `make verify-real-model` downloads just the
+real dense-resident prefix (embed/lm_head/norm + the first `first_k_dense_replace`
+transformer layers — a few GB, not the full 370 GB, since routed MoE experts
+are only ever streamed on demand and aren't needed to prove the loader/kernels
+work) from the real Hugging Face checkpoint, runs a real prompt through the
+real tokenizer with real int4/int8 weights, and asserts the AVX2/AVX-512 and
+Ivy Bridge builds produce byte-identical greedy output (`TEMP=0`) on that real
+data (`QEMU=1` additionally cross-checks under real Ivy Bridge emulation, ~15
+min on real-sized weights — see `c/scripts/verify_real_model.sh`).
+
 ### Benchmark the full model
 
 `make quickstart` (see "Download the model" above) already downloads the

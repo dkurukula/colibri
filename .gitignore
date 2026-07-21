@@ -30,6 +30,7 @@ c/glm_tiny_mix/
 c/glm_bench_medium/
 c/bench/
 c/.bench_bins/
+c/.verify_bins/
 
 # pesi modello / artefatti di run
 *.safetensors
