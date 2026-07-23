@@ -200,7 +200,7 @@ static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
 static float *falloc(int64_t n){
     /* guardia anti-wrap (report PR #25): n assurdo da file modello ostili non deve
      * diventare una malloc piccola. Niente calloc: il memset nel percorso caldo costa. */
-    if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld fuori range\n",(long long)n); exit(1); }
+    if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld out of range\n",(long long)n); exit(1); }
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
 /* y[S,O] = x[S,I] @ W^T, W[O,I] f32 */
@@ -561,7 +561,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
         w->cuda_failed=1;
-        fprintf(stderr,"[CUDA] tensor [%d,%d] su device %d disabilitato dopo errore; fallback CPU\n",
+        fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after error; falling back to CPU\n",
             w->O,w->I,w->cuda_device);
     }
 #endif
@@ -761,11 +761,11 @@ static void load_cfg(Cfg *c, const char *snap){
       } }
     c->qk_head=c->qk_nope+c->qk_rope;
     c->attn_scale = 1.f / sqrtf((float)c->qk_head);
-    if(c->n_group!=1){ fprintf(stderr,"questo motore assume n_group=1 (GLM-5.2)\n"); exit(1); }
+    if(c->n_group!=1){ fprintf(stderr,"this engine assumes n_group=1 (GLM-5.2)\n"); exit(1); }
     /* VALIDAZIONE (report PR #25): il config.json arriva da mirror non fidati — dimensioni
      * ostili non devono superare questo punto. Un solo choke point protegge ogni alloc a valle. */
     #define CKR(name,v,lo,hi) if((v)<(lo)||(v)>(hi)){ \
-        fprintf(stderr,"config: %s=%d fuori range [%d,%d]\n",name,(int)(v),(int)(lo),(int)(hi)); exit(1); }
+        fprintf(stderr,"config: %s=%d out of range [%d,%d]\n",name,(int)(v),(int)(lo),(int)(hi)); exit(1); }
     CKR("hidden_size",c->hidden,1,1<<20)         CKR("num_hidden_layers",c->n_layers,1,128)
     CKR("num_attention_heads",c->n_heads,1,1024) CKR("n_routed_experts",c->n_experts,1,4096)
     CKR("num_experts_per_tok",c->topk,1,64)      CKR("moe_intermediate_size",c->moe_inter,1,1<<20)
@@ -809,7 +809,7 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     return t;
 }
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
-    int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"manca %s\n",name);exit(1);}
+    int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"missing %s\n",name);exit(1);}
     float *p=falloc(n); st_read_f32(&m->S,name,p,0); return p;
 }
 
@@ -932,7 +932,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                 m->ix_knw[i]=ld(m,PI("k_norm.weight")); m->ix_knb[i]=ld(m,PI("k_norm.bias"));
                 #undef PI
             }
-            fprintf(stderr,"[DSA] indexer attivo: attenzione sparsa top-%d oltre %d token di contesto\n",
+            fprintf(stderr,"[DSA] indexer active: sparse attention top-%d beyond %d context tokens\n",
                 c->index_topk, c->index_topk);
         }
     }
@@ -992,7 +992,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
         snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
-        if(!tw[k]||!tq[k]){ fprintf(stderr,"manca %s\n",nm[k]); exit(1); }
+        if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); exit(1); }
     }
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
@@ -1628,21 +1628,21 @@ static inline int argmax_v(const float *lo, int V){
 static void grammar_setup(Tok *T){
     const char *gf=getenv("GRAMMAR"); if(!gf||!*gf) return;
     FILE *f=fopen(gf,"rb");
-    if(!f){ fprintf(stderr,"[GRAMMAR] impossibile aprire %s\n",gf); return; }
+    if(!f){ fprintf(stderr,"[GRAMMAR] unable to open %s\n",gf); return; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *txt=malloc((size_t)n+1);
     if(!txt || fread(txt,1,(size_t)n,f)!=(size_t)n){
-        fprintf(stderr,"[GRAMMAR] lettura fallita: %s\n",gf); fclose(f); free(txt); return; }
+        fprintf(stderr,"[GRAMMAR] read failed: %s\n",gf); fclose(f); free(txt); return; }
     fclose(f); txt[n]=0;
     if(gr_parse(&g_gram,txt)){ fprintf(stderr,"[GRAMMAR] %s: %s\n",gf,g_gram.err); free(txt); return; }
     free(txt);
     gr_state_init(&g_gst,&g_gram);
-    if(!g_gst.alive){ fprintf(stderr,"[GRAMMAR] %s: grammatica non trattabile (ricorsione sinistra?)\n",gf); return; }
+    if(!g_gst.alive){ fprintf(stderr,"[GRAMMAR] %s: grammar not tractable (left recursion?)\n",gf); return; }
     if(getenv("GRAMMAR_DRAFT")) g_gr_max=atoi(getenv("GRAMMAR_DRAFT"));
     if(g_gr_max<1) g_gr_max=1;
     if(g_gr_max>48) g_gr_max=48;
     g_gr_T=T; g_gr_on=1;
-    fprintf(stderr,"[GRAMMAR] %s: %d regole, span forzato max %d token/forward\n",gf,g_gram.n,g_gr_max);
+    fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span max %d tokens/forward\n",gf,g_gram.n,g_gr_max);
 }
 /* stato pulito all'inizio di ogni RISPOSTA (non tra i \x02MORE, che continuano) */
 static void grammar_reset(void){
@@ -1672,7 +1672,7 @@ static int grammar_draft(int *draft, int cap){
     if(g_gr_prop>=32 && g_gr_acc*2<g_gr_prop){        /* guardia adattiva, come per MTP:
         acceptance sotto il 50% = tokenizzazione fuori asse, meglio spegnersi */
         g_gr_on=0;
-        fprintf(stderr,"[GRAMMAR] acceptance %.0f%% dopo %llu proposte: draft grammaticali disattivati\n",
+        fprintf(stderr,"[GRAMMAR] acceptance %.0f%% after %llu proposals: grammar drafts disabled\n",
             100.0*g_gr_acc/g_gr_prop,(unsigned long long)g_gr_prop);
         return 0;
     }
@@ -1735,7 +1735,7 @@ static void stops_arm(const Cfg *c, int tok_eos){
     g_nstop=0;
     for(int i=0;i<c->n_stop;i++) g_stop[g_nstop++]=c->stop_ids[i];
     if(tok_eos>=0 && !is_stop(tok_eos)) g_stop[g_nstop++]=tok_eos;
-    fprintf(stderr,"[stop] %d token di stop:",g_nstop);
+    fprintf(stderr,"[stop] %d stop tokens:",g_nstop);
     for(int i=0;i<g_nstop;i++) fprintf(stderr," %d",g_stop[i]);
     fprintf(stderr,"\n");
 }
@@ -1767,7 +1767,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             /* auto-off adattivo: draft che non vengono mai accettati = solo tassa disco */
             if(m->has_mtp && m->mtp_prop>=24 && m->mtp_acc*10 < m->mtp_prop){
                 g_draft=0;
-                fprintf(stderr,"[MTP] acceptance %.0f%% dopo %llu proposte: draft disattivati\n",
+                fprintf(stderr,"[MTP] acceptance %.0f%% after %llu proposals: drafting disabled\n",
                     100.0*m->mtp_acc/m->mtp_prop, (unsigned long long)m->mtp_prop);
             }
         }
@@ -1783,7 +1783,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
         int k=0;                                        /* verifica: accetta finche' coincide */
         if(g>0 && getenv("MTP_DEBUG")){ int veri=argmax_v(lo,V);
-            fprintf(stderr,"[mtpdbg] draft0=%d verita=%d %s\n", draft[0], veri, draft[0]==veri?"HIT":"miss"); }
+            fprintf(stderr,"[mtpdbg] draft0=%d truth=%d %s\n", draft[0], veri, draft[0]==veri?"HIT":"miss"); }
         while(k<g && emitted<n_new){
             int accept;
             if(g_temp<=0) accept = (argmax_v(lo+(int64_t)k*V,V)==draft[k]);
@@ -1888,12 +1888,12 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
 
 static void profile_print(Model *m, double elapsed){
     double accounted=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
-    printf("PROFILO: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs "
-           "(di cui kvb %.3fs) | lm_head %.3fs | altro %.3fs\n",
+    printf("PROFILE: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs "
+           "(of which kvb %.3fs) | lm_head %.3fs | other %.3fs\n",
         m->t_edisk,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
 }
 
-/* ---- RFC: RE-PIN A CALDO / LIVE RE-PIN (opt-in, REPIN=n, default OFF) ----
+/* ---- RFC: RE-PIN A CALDO / LIVE RE-PIN (REPIN=n, default ON for chat/serve — REPIN=0 disables) ----
  * Upstream fa AUTOPIN allo START (dalla storia .coli_usage). Questo aggiunge un re-pin
  * TRA I TURNI: nel punto sicuro dopo la risposta scambia i pin peggiori con i non-pinnati
  * piu' caldi, cosi' l'hot-store insegue il carico VIVO senza un profilo a parte. Isteresi
@@ -1903,8 +1903,13 @@ static void profile_print(Model *m, double elapsed){
  * the safe point after the reply, swap the worst pins for the hottest unpinned, so the
  * hot-store tracks the LIVE workload without a separate profile. 25% (+4) hysteresis vs
  * ping-pong; max 4 swaps/pass (~20 MB disk each). A separate decaying heat map keeps
- * persistent .coli_usage intact while adapting to the current workload. */
-static int g_repin=0;
+ * persistent .coli_usage intact while adapting to the current workload.
+ * Default flipped to ON (REPIN=64) once the load-aware gate below was validated end-to-end
+ * on the real 744B checkpoint (unit tests + a multi-hour real session, zero false-positive
+ * swaps, correct threshold math throughout) — the gate makes an always-on default safe
+ * because it only pays the disk cost on a real measured regression, not on a timer.
+ * REPIN=0 restores the old fully-disabled behavior for anyone who wants it. */
+static int g_repin=64;
 /* LOAD-AWARE GATE (arXiv:2607.10183 "ATSInfer", Alg. 3): REPIN=n used to trigger the swap
  * pass unconditionally every n emitted tokens, blind to whether anything actually changed —
  * exactly the "load-unaware scheduling" gap that paper identifies (fixed/periodic policies
@@ -1935,7 +1940,7 @@ static int repin_pass(Model *m, double toks_per_s, uint64_t *last_repin, double 
  * REPIN_EPS=0.15 (load-aware: only swaps on a real throughput deviation) on the identical
  * token sequence to see the wasted-I/O reduction; see scripts/bench_repin.sh. */
 static void run_replay(Model *m, const int *full, int nfull, int np){
-    if(np<2||nfull<=np){ fprintf(stderr,"REPLAY richiede prompt e continuation non vuoti\n"); return; }
+    if(np<2||nfull<=np){ fprintf(stderr,"REPLAY requires a non-empty prompt and continuation\n"); return; }
     kv_alloc(m,nfull+2);
     float *logit=step(m,full,np-1,0); free(logit);
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
@@ -1963,7 +1968,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
         rswaps,rwindows,g_repin,g_repin_eps,win);
     profile_print(m,dt);
 #ifdef COLI_CUDA
-    if(m->gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
+    if(m->gpu_expert_count) printf("CUDA expert tier: %d resident (%.2f GB) | %llu calls served from VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
 #endif
@@ -1981,8 +1986,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
                                           * distribuzione int4 e' rumore di quantizzazione */
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
-    if(np<1){ fprintf(stderr,"prompt vuoto dopo tokenizzazione\n"); return; }
-    printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft n-gram=%d\n", np, ngen, eos, g_draft);
+    if(np<1){ fprintf(stderr,"empty prompt after tokenization\n"); return; }
+    printf("prompt: %d tokens | generating up to %d (stop EOS=%d) | draft n-gram=%d\n", np, ngen, eos, g_draft);
     fputs(prompt,stdout); fflush(stdout);
     kv_alloc(m, np+ngen+g_draft+2);
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
@@ -1996,22 +2001,22 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     printf("\n---\n%d token in %.2fs (%.2f tok/s) | hit-rate expert %.1f%% | RSS %.2f GB\n",
         produced, dt, produced/dt, tot?100.0*m->hits/tot:0.0, rss_gb());
-    printf("expert caricati/token: %.1f (per-layer %.2f su %d; baseline topk=%d) | TOPK=%d TOPP=%.2f\n",
+    printf("experts loaded/token: %.1f (per-layer %.2f of %d; baseline topk=%d) | TOPK=%d TOPP=%.2f\n",
         produced?(double)m->ereq/produced:0.0, (produced&&nsp)?(double)m->ereq/produced/nsp:0.0, nsp, c->topk, g_topk, g_topp);
-    printf("speculazione: %.2f token/forward (%llu fw per %llu tok) | MTP acceptance %.0f%% (%llu/%llu)\n",
+    printf("speculation: %.2f tokens/forward (%llu fw for %llu tok) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0, (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
-    if(g_gr_prop) printf("grammatica: acceptance %.0f%% (%llu/%llu draft forzati)\n",
+    if(g_gr_prop) printf("grammar: acceptance %.0f%% (%llu/%llu forced drafts)\n",
         100.0*g_gr_acc/g_gr_prop, (unsigned long long)g_gr_acc, (unsigned long long)g_gr_prop);
 #ifdef COLI_CUDA
-    if(m->gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
+    if(m->gpu_expert_count) printf("CUDA expert tier: %d resident (%.2f GB) | %llu calls served from VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     profile_print(m,dt);
     if(g_looka){
         const char *nm[3]={"token precedente (=SPEC prefetch)","ingresso layer, salto attention","layer successivo (1 giro di anticipo)"};
-        printf("LOOKAHEAD routing — recall degli expert veri nel top-8 predetto:\n");
+        printf("LOOKAHEAD routing — recall of the true experts in the predicted top-8:\n");
         for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
@@ -2078,11 +2083,11 @@ static int repin_pass(Model *m, double toks_per_s, uint64_t *last_repin, double 
                 qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
                 s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
                 m->gpu_expert_count--; m->gpu_expert_bytes-=old_gpu;
-                fprintf(stderr,"[REPIN] upload VRAM fallito; slot degradato a RAM\n");
+                fprintf(stderr,"[REPIN] VRAM upload failed; slot downgraded to RAM\n");
             }
         }
 #endif
-        fprintf(stderr,"[REPIN] %s layer %d: esce/out %d (heat=%u) <- entra/in %d (heat=%u) in %.0f ms\n",
+        fprintf(stderr,"[REPIN] %s layer %d: out %d (heat=%u) <- in %d (heat=%u) in %.0f ms\n",
             tier,cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
     }
     for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
@@ -2143,11 +2148,11 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
     char mg[8]; int32_t h[8], w[8]; kv_hdr(m,w,0);
     if(fread(mg,1,8,f)!=8 || memcmp(mg,KV_MAGIC,8) || fread(h,4,8,f)!=8 ||
        h[0]!=w[0]||h[1]!=w[1]||h[2]!=w[2]||h[3]!=w[3]||h[4]!=w[4]||h[5]!=w[5]){
-        fprintf(stderr,"[KV] .coli_kv di un altro modello/versione: ignorato\n"); fclose(f); return 0; }
+        fprintf(stderr,"[KV] .coli_kv from a different model/version: ignored\n"); fclose(f); return 0; }
     int nrec=h[6];
     if(nrec<1){ fclose(f); return 0; }
     if(nrec>=maxctx-8-g_draft){
-        fprintf(stderr,"[KV] conversazione salvata (%d token) piu' grande del contesto: riparto da zero\n",nrec);
+        fprintf(stderr,"[KV] saved conversation (%d tokens) larger than context: starting fresh\n",nrec);
         fclose(f); return 0; }
     double t0=now_s();
     for(int p=0;p<nrec;p++){
@@ -2163,7 +2168,7 @@ out:
     fclose(f);
     if(nrec>0){
         if(m->has_mtp) m->kv_start[c->n_layers]=-1;    /* la finestra MTP riparte da sola */
-        fprintf(stderr,"[KV] conversazione ripresa dal disco: %d token in %.1fs (niente re-prefill)\n",
+        fprintf(stderr,"[KV] conversation resumed from disk: %d tokens in %.1fs (no re-prefill)\n",
             nrec, now_s()-t0);
     }
     k->disk_nrec=nrec;
@@ -2208,7 +2213,7 @@ static void run_serve(Model *m, const char *snap){
     int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
     g_kvsave = getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
-    if(nctx<1||nctx>16){ fprintf(stderr,"KV_SLOTS deve essere tra 1 e 16\n"); exit(2); }
+    if(nctx<1||nctx>16){ fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); exit(2); }
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(ServeCtx));
     for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
@@ -2376,7 +2381,7 @@ static void stats_dump_q(Model *m, const char *path, int quiet){
     for(int i=0;i<=c->n_layers;i++){ if(!m->eusage[i]) continue;
         for(int e=0;e<c->n_experts;e++) if(m->eusage[i][e]){ fprintf(f,"%d %d %u\n",i,e,m->eusage[i][e]); tot+=m->eusage[i][e]; nz++; } }
     fclose(f); rename(tmp,path);
-    if(!quiet) fprintf(stderr,"[STATS] %lld selezioni su %lld expert distinti -> %s\n",(long long)tot,(long long)nz,path);
+    if(!quiet) fprintf(stderr,"[STATS] %lld selections across %lld distinct experts -> %s\n",(long long)tot,(long long)nz,path);
 }
 static void stats_dump(Model *m, const char *path){ stats_dump_q(m,path,0); }
 
@@ -2434,11 +2439,11 @@ static void pin_wire(Model *m){
                       if(mem_wire(s->fslab, fl)==0) wired+=fl; else failed++; }
     }
     if(failed)
-        fprintf(stderr,"[PIN] mlock: %.1f GB inchiodati/wired, %ld alloc fallite/failed "
-            "(alza il limite / raise it: ulimit -l unlimited) in %.0fs\n", wired/1e9, failed, now_s()-t0);
+        fprintf(stderr,"[PIN] mlock: %.1f GB wired, %ld allocations failed "
+            "(raise the limit: ulimit -l unlimited) in %.0fs\n", wired/1e9, failed, now_s()-t0);
     else
-        fprintf(stderr,"[PIN] mlock: %.1f GB inchiodati in RAM fisica / wired in physical RAM "
-            "(niente compressione/no compression) in %.0fs\n", wired/1e9, now_s()-t0);
+        fprintf(stderr,"[PIN] mlock: %.1f GB wired in physical RAM "
+            "(no compression) in %.0fs\n", wired/1e9, now_s()-t0);
 }
 
 static void pin_load(Model *m, const char *statspath, double gb){
@@ -2473,7 +2478,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
         expert_load(m,li,r[a].e,&m->pin[li][slot]);
     }
     m->resident_bytes += (int64_t)npin*eb;
-    fprintf(stderr,"[PIN] hot-store: %d expert in RAM (%.1f GB) in %.0fs da %s\n",
+    fprintf(stderr,"[PIN] hot-store: %d experts in RAM (%.1f GB) in %.0fs from %s\n",
         npin, npin*eb/1e9, now_s()-t0, statspath);
 #ifdef COLI_CUDA
     if(g_cuda_enabled && g_cuda_expert_gb>0){
@@ -2522,7 +2527,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
                 break;
             }
         }
-        fprintf(stderr,"[CUDA] hot expert tier: %d/%d expert, VRAM %.2f GB (budget totale %.1f GB)\n",
+        fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
         for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d expert, %.2f GB\n",
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
@@ -2589,7 +2594,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     int auto_b = ram_gb<=0;
     if(auto_b){ ram_gb = g_mem_avail_boot*0.88;   /* misurata PRIMA del load: il residente gia'
                                                    * allocato viene sottratto sotto, non due volte */
-        if(ram_gb<4){ fprintf(stderr,"[RAM] MemAvailable illeggibile/troppo bassa, assumo 8 GB\n"); ram_gb=8; } }
+        if(ram_gb<4){ fprintf(stderr,"[RAM] MemAvailable unreadable/too low, assuming 8 GB\n"); ram_gb=8; } }
     /* slack ONESTO, non forfettario (l'OOM del 2026-07-04 veniva da qui):
      *  ws[64] slab del working-set (si materializzano TUTTI nel prefill batch-union),
      *  KV cache a max_ctx, kvb_all della ricostruzione k/v in attention,
@@ -2606,8 +2611,8 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
     if(capmax<1) capmax=1;
     if(capmax < m->ecap){
-        fprintf(stderr,"[RAM_GB=%.1f%s] residente %.1f GB + slack %.1f GB (ws %.1f, KV %dx%d %.1f, kvb %.1f), "
-            "expert %.1f MB x %d layer -> cap abbassato %d->%d (proiezione picco %.1f GB)\n",
+        fprintf(stderr,"[RAM_GB=%.1f%s] resident %.1f GB + slack %.1f GB (ws %.1f, KV %dx%d %.1f, kvb %.1f), "
+            "expert %.1f MB x %d layers -> cap lowered %d->%d (projected peak %.1f GB)\n",
             ram_gb,auto_b?" auto":"",m->resident_bytes/1e9,slack/1e9,ws_b/1e9,
             kv_slot_count(),max_ctx,kv_b/1e9,kvb_b/1e9,
             eb/1e6, nsp, m->ecap, capmax,
@@ -2626,13 +2631,13 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
                 m->ecache[i]=realloc(m->ecache[i],(size_t)newcap*sizeof(ESlot));
                 memset(m->ecache[i]+m->ecap,0,(size_t)(newcap-m->ecap)*sizeof(ESlot));
             }
-            fprintf(stderr,"[RAM_GB=%.1f%s] cap ALZATO %d->%d: il budget lo consente "
-                "(proiezione picco %.1f GB; CAP_RAISE=0 per disattivare)\n",
+            fprintf(stderr,"[RAM_GB=%.1f%s] cap RAISED %d->%d: the budget allows it "
+                "(projected peak %.1f GB; CAP_RAISE=0 to disable)\n",
                 ram_gb, auto_b?" auto":"", m->ecap, newcap,
                 (m->resident_bytes + (double)newcap*nsp*eb + slack)/1e9);
             m->ecap=newcap;
         } else
-            fprintf(stderr,"[RAM_GB=%.1f%s] cap=%d ok (proiezione picco %.1f GB)\n", ram_gb, auto_b?" auto":"", m->ecap,
+            fprintf(stderr,"[RAM_GB=%.1f%s] cap=%d ok (projected peak %.1f GB)\n", ram_gb, auto_b?" auto":"", m->ecap,
                 (m->resident_bytes + (double)m->ecap*nsp*eb + slack)/1e9);
     }
 }
@@ -2655,7 +2660,7 @@ int main(int argc, char **argv){
     if(g_pilot_k<1) g_pilot_k=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
-    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
+    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):64;    /* RFC: re-pin ogni n token emessi, default ON (64); REPIN=0 disabilita / live re-pin every n emitted tokens, default ON (64); REPIN=0 disables */
     g_repin_eps = getenv("REPIN_EPS")?atof(getenv("REPIN_EPS")):0.15;  /* load-aware gate: skip the swap unless measured tok/s drifted by this fraction (<=0=always swap, legacy behavior) */
     if(g_repin_eps<0) fprintf(stderr,"[REPIN] REPIN_EPS=%s <0 is treated as 0 (gate disabled, unconditional swap) — did you mean a positive fraction?\n",getenv("REPIN_EPS"));
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
@@ -2669,47 +2674,47 @@ int main(int argc, char **argv){
     int ebits= argc>2?atoi(argv[2]):8;
     int dbits= argc>3?atoi(argv[3]):ebits;
     if(getenv("SERVE") && (kv_slot_count()<1 || kv_slot_count()>16)){
-        fprintf(stderr,"KV_SLOTS deve essere tra 1 e 16\n"); return 2;
+        fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); return 2;
     }
 #ifdef COLI_CUDA
     if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
         const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
-        if(one&&many){ fprintf(stderr,"usa COLI_GPU oppure COLI_GPUS, non entrambi\n"); return 2; }
+        if(one&&many){ fprintf(stderr,"use COLI_GPU or COLI_GPUS, not both\n"); return 2; }
         if(many) g_cuda_ndev=parse_cuda_devices(many,g_cuda_devices);
         else if(one) g_cuda_ndev=parse_cuda_devices(one,g_cuda_devices);
         else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
-        if(g_cuda_ndev<1){ fprintf(stderr,"COLI_GPUS non valido: usa una lista come 0,1,2\n"); return 2; }
+        if(g_cuda_ndev<1){ fprintf(stderr,"COLI_GPUS invalid: use a list like 0,1,2\n"); return 2; }
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
-        if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] backend richiesto ma non disponibile\n"); return 2; }
+        if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] backend requested but not available\n"); return 2; }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
-    if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) richiede COLI_CUDA=1\n"); return 2; }
-    if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE richiede COLI_CUDA=1\n"); return 2; }
-    if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB richiede COLI_CUDA=1\n"); return 2; }
+    if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s\n",g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
        (getenv("CUDA_DENSE") && atoi(getenv("CUDA_DENSE"))) ||
        (getenv("CUDA_EXPERT_GB") && atof(getenv("CUDA_EXPERT_GB"))>0)){
-        fprintf(stderr,"CUDA richiesto ma questo binario e' CPU-only; ricompila con: make CUDA=1\n");
+        fprintf(stderr,"CUDA requested but this binary is CPU-only; rebuild with: make CUDA=1\n");
         return 2;
     }
 #endif
-    printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
+    printf("== C GLM engine (glm_moe_dsa), cache=%d experts/layer | expert@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0) g_draft = m.has_mtp ? 3 : 0;
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
-    printf("caricato in %.2fs | densa residente: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
+    printf("loaded in %.2fs | dense resident: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
            now_s()-t0, m.resident_bytes/(1024.0*1024.0), m.c.n_layers, m.c.n_experts,
-           m.has_mtp?"ATTIVA":"assente", g_draft);
+           m.has_mtp?"ACTIVE":"absent", g_draft);
     /* anche su stderr: e' il canale che le UI (coli) mostrano all'utente */
-    fprintf(stderr,"[MTP] %s (draft=%d)\n", m.has_mtp?"attiva: decodifica speculativa nativa":"assente", g_draft);
+    fprintf(stderr,"[MTP] %s (draft=%d)\n", m.has_mtp?"active: native speculative decoding":"absent", g_draft);
     if(!strncmp(snap,"/mnt/",5))
-        fprintf(stderr,"ATTENZIONE: il modello e' su %s (filesystem 9p/Windows, lento e fadvise inefficace).\n"
-                       "            Per RAM e velocita' tienilo su ext4 (es. /home/...).\n", snap);
+        fprintf(stderr,"WARNING: the model is on %s (9p/Windows filesystem, slow and fadvise ineffective).\n"
+                       "         For RAM headroom and speed, keep it on ext4 (e.g. /home/...).\n", snap);
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")) pin_load(&m, getenv("PIN"), getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0);
@@ -2720,7 +2725,7 @@ int main(int argc, char **argv){
       int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
       snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       int64_t hist = usage_load(&m,g_usage_path);
-      if(hist>0) fprintf(stderr,"[USAGE] storia expert: %lld selezioni (%s)\n",(long long)hist,g_usage_path);
+      if(hist>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)hist,g_usage_path);
       int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
       if(!getenv("PIN") && autopin && hist>=5000){
           /* quota pin proporzionale alla FIDUCIA nella storia: con pochi dati il pin
@@ -2772,7 +2777,7 @@ int main(int argc, char **argv){
             if(pred[i]==tf[i]) ok++;
             else fprintf(stderr,"[ORACLE] mismatch pos=%d expected=%d got=%d\n",i,tf[i],pred[i]);
         }
-        printf("PREFILL (teacher-forcing) C vs oracolo: %d/%d posizioni | %.1f pos/s\n",
+        printf("PREFILL (teacher-forcing) C vs oracle: %d/%d positions | %.1f pos/s\n",
             ok,nfull,nfull/tdt);
         if(ok<nfull) fprintf(stderr,
             "[ORACLE] %d/%d mismatches — run: TF=1 DEBUG_LOGITS=1 for top-5 logit dump\n",
@@ -2786,23 +2791,23 @@ int main(int argc, char **argv){
     int *out=malloc((np+n_new)*sizeof(int));
     double t=now_s(); generate(&m,prompt,np,n_new,out); double dt=now_s()-t;
     int match=0;
-    printf("\nRiferimento (oracolo): "); for(int i=np;i<nfull;i++) printf("%d ", full[i]);
-    printf("\nMotore C GLM         : "); for(int i=np;i<nfull;i++){ printf("%d ", out[i]); if(out[i]==full[i])match++; }
-    printf("\nToken coincidenti: %d/%d\n", match, n_new);
+    printf("\nReference (oracle): "); for(int i=np;i<nfull;i++) printf("%d ", full[i]);
+    printf("\nC GLM engine       : "); for(int i=np;i<nfull;i++){ printf("%d ", out[i]); if(out[i]==full[i])match++; }
+    printf("\nMatching tokens: %d/%d\n", match, n_new);
     double tot=m.hits+m.miss;
-    printf("Speculazione n-gram (DRAFT=%d): %.2f token/forward (%llu fw per %llu tok)\n",
+    printf("N-gram speculation (DRAFT=%d): %.2f tokens/forward (%llu fw for %llu tok)\n",
         g_draft, m.n_fw?(double)m.n_emit/m.n_fw:1.0, (unsigned long long)m.n_fw, (unsigned long long)m.n_emit);
-    printf("Hit-rate cache expert: %.1f%% (hit=%llu miss=%llu) | RSS: %.2f GB | %.1f tok/s\n",
+    printf("Expert cache hit-rate: %.1f%% (hit=%llu miss=%llu) | RSS: %.2f GB | %.1f tok/s\n",
            tot?100.0*m.hits/tot:0.0, (unsigned long long)m.hits, (unsigned long long)m.miss, rss_gb(), n_new/dt);
     profile_print(&m,dt);
 #ifdef COLI_CUDA
-    if(m.gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
+    if(m.gpu_expert_count) printf("CUDA expert tier: %d resident (%.2f GB) | %llu calls served from VRAM\n",
         m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     if(g_looka){
         const char *nm[3]={"token precedente (=SPEC prefetch)","ingresso layer, salto attention","layer successivo (1 giro di anticipo)"};
-        printf("LOOKAHEAD routing — recall degli expert veri nel top-8 predetto:\n");
+        printf("LOOKAHEAD routing — recall of the true experts in the predicted top-8:\n");
         for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }

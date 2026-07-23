@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Supervisore della conversione GLM-5.2 — a prova di rete WSL che si blocca.
-#  - tiene SEMPRE vivo un (solo) convertitore
-#  - se un download resta FERMO >180s (connessione zombie), lo ammazza e lo rilancia:
-#    hf_hub riprende il .incomplete dal punto esatto, non si perde nulla
-#  - esce da solo quando tutti i 141 shard sono fatti
-# uso da c/:  nohup scripts/supervisor.sh > supervisor.log 2>&1 &
+# GLM-5.2 conversion supervisor — resilient to WSL's network stalling.
+#  - always keeps exactly ONE converter alive
+#  - if a download sits STILL for >180s (zombie connection), kills and restarts it:
+#    hf_hub resumes the .incomplete from the exact byte, nothing is lost
+#  - exits by itself once all 141 shards are done
+# usage from c/:  nohup scripts/supervisor.sh > supervisor.log 2>&1 &
 set -u
 DIR="${COLI_MODEL:-/home/vincenzo/glm52_i4}"
 CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOTAL="${TOTAL_SHARDS:-141}"
-STALL_S=180          # secondi senza crescita del download -> riavvio
+STALL_S=180          # seconds without download growth -> restart
 CONVLOG=/tmp/convert_supervised.log
 
 exec 9>"$DIR/.supervisor.lock"
-flock -n 9 || { echo "supervisore gia' attivo, esco"; exit 1; }
+flock -n 9 || { echo "supervisor already running, exiting"; exit 1; }
 
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
 
@@ -21,16 +21,16 @@ start_conv(){
     cd "$CODE"
     nohup python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 \
         --outdir "$DIR" --ebits 4 --io-bits 8 >> "$CONVLOG" 2>&1 &
-    log "convertitore avviato (PID $!)"
+    log "converter started (PID $!)"
 }
 
 last_size=-1; stall=0
 while :; do
     done_n=$(ls "$DIR"/out-*.safetensors 2>/dev/null | wc -l)
-    if [ "$done_n" -ge "$TOTAL" ]; then log "FATTO: $done_n/$TOTAL shard. Esco."; pkill -f convert_fp8 2>/dev/null; exit 0; fi
+    if [ "$done_n" -ge "$TOTAL" ]; then log "DONE: $done_n/$TOTAL shards. Exiting."; pkill -f convert_fp8 2>/dev/null; exit 0; fi
 
     if ! pgrep -f convert_fp8 >/dev/null; then
-        log "convertitore non attivo ($done_n/$TOTAL): lo avvio"
+        log "converter not running ($done_n/$TOTAL): starting it"
         start_conv; last_size=-1; stall=0; sleep 20; continue
     fi
 
@@ -40,16 +40,16 @@ while :; do
         if [ "$size" = "$last_size" ]; then
             stall=$((stall+30))
             if [ "$stall" -ge "$STALL_S" ]; then
-                log "download FERMO da ${stall}s a $((size/1000000)) MB ($done_n/$TOTAL): riavvio il convertitore"
+                log "download STALLED for ${stall}s at $((size/1000000)) MB ($done_n/$TOTAL): restarting the converter"
                 pkill -f convert_fp8; sleep 5
                 start_conv; last_size=-1; stall=0
             fi
         else
-            [ "$last_size" -ge 0 ] && [ "$stall" -ge 60 ] && log "download ripreso ($((size/1000000)) MB)"
+            [ "$last_size" -ge 0 ] && [ "$stall" -ge 60 ] && log "download resumed ($((size/1000000)) MB)"
             last_size=$size; stall=0
         fi
     else
-        last_size=-1; stall=0     # niente .incomplete = sta convertendo/salvando: tutto ok
+        last_size=-1; stall=0     # no .incomplete = converting/saving: all good
     fi
     sleep 30
 done
