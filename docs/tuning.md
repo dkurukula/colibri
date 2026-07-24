@@ -1,0 +1,152 @@
+# Tuning & runtime knobs
+
+Everything here is opt-in; the defaults are chosen so a plain `./coli chat`
+is safe on any machine. See also [SETTINGS.md](SETTINGS.md) and
+[ENVIRONMENT.md](ENVIRONMENT.md) for the full variable inventory.
+
+## The knobs that matter most
+
+| knob | what it does |
+|---|---|
+| `--temp T` | token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy) |
+| `--topp 0.7` | adaptive expert top-p (30–40% less disk; lossy — prints a warning) |
+| `--ngen N` | max tokens per answer (`:more` in chat continues a truncated one) |
+| `--repin N` | adapt RAM/VRAM hot experts every N emitted tokens |
+| `RAM_GB=<n>` | claim more RAM for the expert cache than the conservative auto-detect |
+| `PIN=stats PIN_GB=g` | pin the hottest experts from a measured usage profile |
+| `DRAFT=n` | MTP draft depth (0 disables speculation) |
+| `GRAMMAR=g.gbnf` | grammar-forced drafts for constrained JSON/NDJSON output ([docs](grammar-draft.md)) |
+| `THINK=1` | enable GLM-5.2's reasoning block |
+| `PILOT=1` | router-lookahead disk prefetch (see below) |
+| `URING=1` | Linux-only batched expert I/O (implies `PIPE=1`) |
+| `PIPE=0` | disable the async expert-load pool (default ON — overlaps `pread` with matmul, −18% disk service) |
+| `DIRECT=1` | O_DIRECT expert reads (measured **+65%** alone on a Strix Halo, [#200](https://github.com/JustVugg/colibri/issues/200)) |
+| `COLI_NUMA=1` | interleave resident weights across NUMA nodes on multi-socket hosts ([#82](https://github.com/JustVugg/colibri/issues/82)) |
+| `CACHE_ROUTE=1` | cache-aware max-rank routing (opt-in, [#199](https://github.com/JustVugg/colibri/issues/199)) |
+| `AUTOPIN=0` | disable the learning cache's auto-pin |
+| `CAP_RAISE=0` | don't auto-grow the expert cache |
+| `KVSAVE=0` | disable KV-cache persistence |
+| `TF=1` | teacher-forcing validation |
+
+## Resource policy
+
+`coli plan` reports the planned hot (VRAM), warm (RAM), and cold backing (disk)
+tiers, the reason for each placement, and the expected bottleneck. The default
+`--policy quality` and `--policy balanced` modes preserve checkpoint quantization
+and router decisions unless `--topk` or `--topp` is passed; those explicit lossy
+overrides print a warning and proceed.
+
+Auto-tier plans size OpenMP from physical cores and bind workers across cores.
+Memory-bound quantized kernels can regress sharply when SMT siblings compete for
+limited memory channels; explicit `OMP_*` settings always take precedence.
+
+> Note (#471): exporting `OMP_PROC_BIND`/`OMP_PLACES` used to interact badly with
+> the engine's one-time OpenMP tuning re-exec on Linux — the re-exec'd image
+> inherited the first image's place-0 thread binding and the whole team landed on
+> one core (~20× slowdown). The engine now resets its affinity to all online CPUs
+> right before the re-exec, so explicit `OMP_*` pinning works as documented.
+> `COLI_OMP_TUNED=1` remains the escape hatch that skips the re-exec entirely.
+
+```bash
+coli plan --model /models/glm52_i4 --policy quality
+coli run --auto-tier --policy quality "Explain MoE offloading"
+# Explicit research-only router reduction:
+coli run --policy experimental-fast --topk 4 "Benchmark prompt"
+```
+
+Disk is an immutable recovery source, not a normal decode target. If the plan
+leaves cold expert bytes on disk, speed depends on cache hit rate; output quality
+does not.
+
+Cold expert reads can use a deferred pipeline: resident RAM/VRAM experts execute
+while missing experts are loaded in a bounded background I/O pool, then the cold
+results join before the layer completes. The pool engages only under `PIPE=1`;
+`PIPE_WORKERS=n` sets its worker count (default 8). Profiling reports both disk
+service time and the smaller foreground-visible wait time so overlap is explicit.
+
+`--policy balanced` enables lossless live placement (`REPIN=64`). At safe request
+boundaries, a per-layer LFRU score combines decaying session frequency with recent
+access and replaces at most four sufficiently colder pinned experts. `--policy
+quality` leaves live replacement off by default; `REPIN=0` always disables it.
+
+The swap itself is gated on measured load, not just token count (concept from
+[arXiv:2607.10183 "ATSInfer"](https://arxiv.org/abs/2607.10183), Algorithm 3):
+`REPIN=n` stays the minimum check interval, but the engine only pays the disk
+cost of a swap once this turn's measured tok/s has drifted from a rolling
+per-slot baseline by more than `REPIN_EPS` (default `0.15`) — otherwise it just
+tracks the drift and rechecks later. This applies automatically wherever
+`REPIN` is already nonzero, including `--policy balanced`. `REPIN_EPS<=0`
+restores the old unconditional-every-N-tokens behavior.
+
+## CPU tier: build for your vector ISA
+
+`ARCH=` (passed to `make`, or `--arch` to `scripts/quickstart.sh`/`scripts/podman.sh`)
+selects the `-march` value the quantized matmul and integer IDOT kernels
+compile against:
+
+| CPU | build | matmul kernel | IDOT kernel |
+|---|---|---|---|
+| Haswell+ (2013+), AVX2/FMA | `make` (`ARCH=native`, default) | AVX2 FMA | avx2 |
+| Alder Lake+/Zen4+, AVX-VNNI | `make` (`ARCH=native` on that CPU) | AVX2 FMA | avx-vnni |
+| Skylake-X+, AVX-512 VNNI | `make` (`ARCH=native` on that CPU) | AVX2 FMA | avx512-vnni |
+| **Sandy/Ivy Bridge (2011-2012), AVX only** | `make ARCH=ivybridge` | AVX (no FMA) | ssse3 |
+| SSSE3/SSE4.2 without AVX | `make ARCH=x86-64-v2` | scalar | ssse3 |
+| Anything older (SSE-only) | `make ARCH=x86-64` | scalar | scalar |
+
+Without a CPU-appropriate `ARCH`, a pre-AVX2 machine silently gets the slower
+kernel tier instead of failing outright — check the boot banner's `idot: ...`
+field, or build with the wrong tier and compare. Measured on a Xeon E5-2660 v2
+("Ivy Bridge", no AVX2/FMA, confirmed via `/proc/cpuinfo`) with the real
+744B GLM-5.2 model, identical prompt and config: `ARCH=ivybridge` (idot: ssse3)
+vs. a build that falls through to the scalar path (idot: scalar) — prefill
+118.78s → 58.70s, decode 73.42s → 31.91s for 2 tokens, expert-matmul effective
+bandwidth 1.08 → 3.20 GB/s (prefill) and 0.89 → 3.10 GB/s (decode). `make
+portable-avx` (`ARCH=sandybridge`) builds a binary to distribute to any
+AVX-only machine, mirroring `make portable`'s `ARCH=x86-64-v3` for AVX2 hosts.
+
+## The learning cache
+
+The engine records which experts your usage actually routes to (`.coli_usage`
+next to the model, updated every turn) and at startup automatically pins the
+hottest ones in spare RAM — colibrì literally gets faster the more you use it.
+`PIN=auto` seeds the pin directly from the live usage history
+([#301](https://github.com/JustVugg/colibri/pull/301)).
+
+**The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine
+*raises* the LRU cap to fill your `--ram` budget instead of only lowering it.
+If you benchmarked colibrì before that date, rerun — your numbers were capped.
+
+**Live tier adaptation** (`--repin N`, opt-in): at safe turn boundaries, a
+decaying session heat map replaces cold pinned experts with hotter streamed
+experts. A 25% hysteresis and a four-swap limit prevent tier thrashing.
+Persistent `.coli_usage` remains the long-term signal and is not decayed.
+
+## Router-lookahead prefetch (`PILOT=1`, experimental)
+
+GLM-5.2's expert routing is measurably predictable *ahead of time* — applying
+layer L+1's router to layer L's post-attention state recalls **71.6%** of the
+true top-8 (vs 41.3% for "same experts as last token"). `PILOT=1` issues
+next-layer expert readahead from a dedicated I/O thread while the current layer
+computes. `PILOT_REAL=1` moves the prefetched loads off the critical path
+(measured +11pp hit rate on a big-cache host), and `PILOT_TWO=1` folds the
+computed shared-expert into the prediction (+3% recall,
+[#200](https://github.com/JustVugg/colibri/issues/200)). On disk-saturated
+hosts hint-only PILOT can be net negative — measure on yours.
+
+## Speculation and reproducibility
+
+Speculative decoding requires that the draft and verify paths compute the same
+function — `SPEC_PIN=1` (default since [#294](https://github.com/JustVugg/colibri/pull/294))
+pins every forward issued while drafts are live to the platform's S=1 kernel
+family. For byte-exact reproducibility across runs: `DRAFT=0`, plus `IDOT=0
+COLI_CUDA=0` if you also want kernel-family/GPU independence. Acceptance
+percentages are not comparable across engine versions under `--topp`
+([#163](https://github.com/JustVugg/colibri/issues/163) has the full story).
+
+## Conversations reopen warm
+
+`coli chat` persists the compressed MLA KV-cache to disk after every turn
+(`.coli_kv`, ~182 KB/token, appended incrementally, crash-safe). Close the chat,
+reopen it tomorrow — the model still remembers the whole conversation and **zero
+re-prefill happens**: validated byte-identical to an uninterrupted session.
+`:reset` clears it, `KVSAVE=0` disables it.
