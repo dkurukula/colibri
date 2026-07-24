@@ -60,6 +60,7 @@ stats*.txt
 c/backend_metal.o
 c/backend_metal_test
 c/tests/test_tier
+c/tests/test_repin
 c/mio_env/
 c/bench/
 c/tests/test_decode_batch

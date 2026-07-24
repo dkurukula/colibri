@@ -40,7 +40,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--temp` | none (`0`=greedy; engine default 1.0) | `TEMP` | Sampling temperature. |
 | `--topp` | `0` | `TOPP` | Top-p filter. |
 | `--topk` | `0` | `TOPK` | Top-k filter. |
-| `--repin` | `0` | `REPIN` | Re-pin experts every N tokens. |
+| `--repin` | none (defers to the engine's own default, `0`; `--policy balanced` sets `64`) | `REPIN` | Re-pin experts every N tokens. `--repin 0` explicitly disables it (unlike omitting the flag). |
 | `--policy` | `quality` | `COLI_POLICY` | `quality` \| `balanced` \| `experimental-fast`. |
 | `--gpu` | `None` | `COLI_GPU(S)` | `auto`, `none`, or a device list like `0,1`. |
 | `--vram` | `0` (auto) | CUDA plan | Total VRAM budget in GB. |

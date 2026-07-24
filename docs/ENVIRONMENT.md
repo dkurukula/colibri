@@ -51,7 +51,8 @@ Format: `VAR` — default — effect.
 | `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |
 | `PIN_GB` | `10.0` | Size budget (GB) for the pinned hot store when `PIN` is set. |
 | `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. |
-| `REPIN` | `0` (off) | Live re-pin the hot store every N emitted tokens (RFC). |
+| `REPIN` | `0` (off) | Live re-pin the hot store every N emitted tokens (RFC; `--policy balanced` sets 64). |
+| `REPIN_EPS` | `0.15` | Load-aware gate for `REPIN`: once N tokens have elapsed, only pay the swap's disk cost if this turn's measured tok/s drifted from a rolling per-slot baseline by more than this fraction (concept from arXiv:2607.10183 "ATSInfer" Alg. 3). `REPIN_EPS<=0` restores the plain unconditional-every-N-tokens behavior. No effect when `REPIN=0`. |
 | `PILOT` | `0` (off) | Router-piloted cross-layer expert prefetch. |
 | `PILOT_REAL` | `0` (off) | Value-preserving real cross-layer prefetch loads (`PILOT_REAL=1` opts in). |
 | `PILOT_K` | `6` if `PILOT_REAL` else `8` | Number of experts the pilot prefetches per step. |
