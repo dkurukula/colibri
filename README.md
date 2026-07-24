@@ -234,6 +234,18 @@ git clone https://github.com/JustVugg/colibri && cd colibri/c
 Want `coli` on your PATH? From a checkout, `pip install -e .` registers it (the
 engine still lives in `c/` — an editable install from the clone, not a wheel).
 
+**Or run it in podman** — one script builds the image and runs the engine
+inside it, no compiler needed on the host:
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri
+COLI_MODEL=/nvme/glm52_i4 c/scripts/podman.sh chat
+```
+
+See [docs/podman.md](docs/podman.md) for tunables (`ARCH`, `RAM_GB`, `REPIN`,
+`PORT`, …) and the `make podman-chat` / `make podman-serve` shortcuts. A manual
+[`docker/`](docker/README.md) guide also ships with the project.
+
 ### 2. Get the model
 
 A pre-converted **GLM-5.2 int4** container is on Hugging Face — **use the
@@ -279,6 +291,7 @@ and the optional API gateway.
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+| Running colibrì in podman | [docs/podman.md](docs/podman.md) |
 
 ## What's next
 
