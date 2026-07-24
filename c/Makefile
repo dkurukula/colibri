@@ -57,7 +57,7 @@ CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_repin$(EXE) tests/test_grammar$(EXE)
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -112,6 +112,9 @@ tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 tests/test_tier$(EXE): tests/test_tier.c tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_repin$(EXE): tests/test_repin.c repin.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -140,6 +143,23 @@ clean:
 bench-cpu-tiers:
 	bash scripts/bench_cpu_tiers.sh
 
+# Benchmark the load-aware live re-pin gate (arXiv:2607.10183 "ATSInfer" Alg. 3):
+# REPIN_EPS=0 (legacy, unconditional swap every N tokens) vs REPIN_EPS=0.15
+# (load-aware, only swaps on a real throughput deviation), same token sequence,
+# reports the wasted-disk-I/O-swap reduction. Needs (one-time, only to generate
+# the fixture if missing): pip install torch transformers safetensors
+bench-repin:
+	bash scripts/bench_repin.sh
+
+# Verify the engine loads and runs a REAL GLM-5.2 checkpoint (real config, real
+# tokenizer, real int4/int8 weights) end to end, and that the AVX-only Ivy Bridge
+# build produces byte-identical output to AVX2/AVX-512 on those same real weights.
+# Downloads a few GB (the dense-resident prefix only, not the full 370 GB model) —
+# needs network. Set QEMU=1 to also cross-check under real -cpu IvyBridge emulation
+# (slow: ~15 min on real weights). See scripts/verify_real_model.sh for tunables.
+verify-real-model:
+	bash scripts/verify_real_model.sh
+
 # One command: download the real 744B GLM-5.2 int4 model and benchmark it.
 # Asks for/confirms a download location, checks free disk space first, fixes
 # the known int4-vs-int8 MTP head gotcha automatically, builds for this CPU,
@@ -148,4 +168,4 @@ bench-cpu-tiers:
 quickstart:
 	bash scripts/quickstart.sh $(ARGS)
 
-.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean bench-cpu-tiers quickstart
+.PHONY: all glm cuda-test portable portable-avx test-c test-python test check clean bench-cpu-tiers bench-repin verify-real-model quickstart

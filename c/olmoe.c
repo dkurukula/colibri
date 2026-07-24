@@ -137,7 +137,7 @@ static void load_cfg(Cfg *c, const char *snap) {
 
 static float *load_t(Model *m, const char *name) {
     int64_t n = st_numel(&m->S, name);
-    if (n < 0) { fprintf(stderr, "manca %s\n", name); exit(1); }
+    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
     float *p = falloc(n);
     st_read_f32(&m->S, name, p, 0);   /* densa: niente DONTNEED, resta residente */
     return p;
@@ -369,7 +369,7 @@ int main(int argc, char **argv) {
     int np, nfull; int *prompt = read_int_array(ref,"prompt_ids",&np); int *full = read_int_array(ref,"full_ids",&nfull);
     int n_new = nfull - np;
 
-    printf("== Motore C streaming, cache = %d expert/layer, expert @ %d-bit ==\n", cap, bits);
+    printf("== C streaming engine, cache = %d experts/layer, expert @ %d-bit ==\n", cap, bits);
     Model m; model_init(&m, snap, cap, bits);
     printf("densa caricata in %.1fs | RSS dopo load densa: %.2f GB\n", m.dense_load_s, rss_gb());
 
@@ -386,7 +386,7 @@ int main(int argc, char **argv) {
     printf("\nRSS PICCO: %.2f GB\n", rss_gb());
     printf("Hit-rate cache expert: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
-    printf("Velocita': %.2f tok/s (%.1fs per %d token)\n", n_new/dt, dt, n_new);
+    printf("Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
     free(buf); free(arena);
     return 0;
 }

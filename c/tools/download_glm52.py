@@ -28,23 +28,23 @@ def check():
     sts = [s for s in info.siblings if s.rfilename.endswith(".safetensors")]
     free = shutil.disk_usage(os.path.dirname(DEST) or "/").free
     print(f"repo: {REPO}")
-    print(f"  file totali: {len(info.siblings)} ({len(sts)} shard safetensors)")
-    print(f"  dimensione totale: {human(tot)}")
-    print(f"  spazio libero in {DEST}: {human(free)}")
-    print(f"  {'OK: ci sta' if free > tot*1.05 else 'ATTENZIONE: spazio insufficiente'}")
+    print(f"  total files: {len(info.siblings)} ({len(sts)} safetensors shards)")
+    print(f"  total size: {human(tot)}")
+    print(f"  free space in {DEST}: {human(free)}")
+    print(f"  {'OK: fits' if free > tot*1.05 else 'WARNING: insufficient space'}")
 
 def download():
     os.makedirs(DEST, exist_ok=True)
     free = shutil.disk_usage(DEST).free
-    print(f"Scarico {REPO} -> {DEST}  (libero: {human(free)})")
-    # resume_download e' implicito; in caso di interruzione, rilancia e riprende.
+    print(f"Downloading {REPO} -> {DEST}  (free: {human(free)})")
+    # resume_download is implicit; if interrupted, rerun and it resumes.
     snapshot_download(
         repo_id=REPO,
         local_dir=DEST,
         allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model"],
         max_workers=8,
     )
-    print("FATTO. Pesi in:", DEST)
+    print("DONE. Weights in:", DEST)
 
 if __name__ == "__main__":
     if "--check" in sys.argv:

@@ -110,7 +110,29 @@ This skips the FP8 → int4 conversion step entirely.
 
 Thanks DatPat for your help!
 
-### Quick start
+### Run it in podman (recommended)
+
+The default, easiest way to run colibrì: one script builds the image (once) and
+runs the engine inside it — no manual `podman run -v ... -e ...` needed.
+
+```bash
+COLI_MODEL=/nvme/glm52_i4 c/scripts/podman.sh chat
+COLI_MODEL=/nvme/glm52_i4 c/scripts/podman.sh serve --host 0.0.0.0
+COLI_MODEL=/nvme/glm52_i4 c/scripts/podman.sh run "The capital of France is"
+
+# or via make, from the repo root:
+make podman-chat COLI_MODEL=/nvme/glm52_i4
+make podman-serve COLI_MODEL=/nvme/glm52_i4
+```
+
+Tunables (env): `IMAGE` (image tag), `ARCH` (CPU tier — default `native`; pass
+`ivybridge` etc. for older CPUs, see "CPU tier" below), `RAM_GB`, `REPIN`/`REPIN_EPS`
+(live re-pin gate — see "Live tier adaptation" below), `PORT` (for `serve`),
+`REBUILD=1` to force a rebuild. See `c/scripts/podman.sh` for the full list.
+The model directory is mounted read-write so `.coli_kv` and `.coli_usage`
+persist across runs, same as running the engine directly.
+
+### Quick start (bare metal)
 
 ```bash
 cd c
@@ -347,7 +369,7 @@ works against the colibrì OpenAI-compatible server (in review, #21) or any othe
 compatible endpoint. Nothing leaves the endpoint you configure. The terminal
 `coli chat` remains the first-class interface.
 
-Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
+Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens (on by default, N=64 — `--repin 0` disables), `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
 
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
 
@@ -355,11 +377,46 @@ Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 
 
 **The learning cache**: the engine records which experts your usage actually routes to (`.coli_usage` next to the model, updated every turn) and at startup automatically pins the hottest ones in spare RAM. colibrì literally gets faster the more you use it.
 
-**Live tier adaptation** (`--repin N`, opt-in): at safe turn boundaries, a decaying
-session heat map replaces cold pinned experts with hotter streamed experts. Replacement
-loads the expert from disk into the existing RAM slot; GPU-backed slots immediately
-refresh the same VRAM tier budget. A 25% hysteresis and a four-swap limit prevent tier
-thrashing. Persistent `.coli_usage` remains the long-term signal and is not decayed.
+**Live tier adaptation** (`--repin N`, **on by default**, N=64 — `--repin 0` disables): at
+safe turn boundaries, a decaying session heat map replaces cold pinned experts with hotter
+streamed experts. Replacement loads the expert from disk into the existing RAM slot;
+GPU-backed slots immediately refresh the same VRAM tier budget. A 25% hysteresis and a
+four-swap limit prevent tier thrashing. Persistent `.coli_usage` remains the long-term
+signal and is not decayed. The swap itself is gated on measured load, not just token count
+(concept from
+["Automated Tensor Scheduling for Hybrid CPU-GPU LLM Inference on Consumer Devices"](https://arxiv.org/abs/2607.10183),
+arXiv:2607.10183 — its Algorithm 3): N is the minimum check interval, but the engine only
+pays the disk cost of a swap when this turn's measured tok/s has drifted from a rolling
+baseline by more than `REPIN_EPS` (default 0.15, the paper's own chosen threshold) —
+otherwise it just tracks the drift and rechecks later. This also fixes the swap pass
+never firing on ordinary (non-continuation) turns — expect up to a few hundred ms of
+disk-bound latency on the turn that triggers a swap, exactly as `--repin` always
+documented, now actually happening for normal chat instead of only the rare truncated-
+response continuation. `REPIN_EPS<=0` restores the old unconditional-every-N-tokens
+behavior. The baseline needs two consistent readings before it's trusted (a single noisy
+first sample shouldn't anchor every future check), so the earliest possible swap moves
+from N tokens to roughly 2N; each `--kv-slots` conversation tracks its own baseline, so
+one slot's normal throughput is never misread as a regression relative to another's.
+
+Reproduce the swap-count reduction: `make bench-repin` (needs, one-time,
+`pip install torch transformers safetensors` to generate a small local fixture — no
+download of the real model). It replays the same deterministic token sequence twice —
+once with `REPIN_EPS=0` (legacy, unconditional swap every N tokens) and once with
+`REPIN_EPS=0.15` (load-aware) — through the exact gate code chat/API turns use, and
+reports how many of the fixed-size windows actually paid a disk-read swap:
+
+```
+| REPIN_EPS | windows swapped (median of 5) |
+|---|---|
+| 0    (legacy)     | 4/30 |
+| 0.15 (load-aware) | 1/30 |
+
+load-aware gate avoided 75% of the disk-I/O swaps legacy paid on the identical token sequence
+```
+
+(Numbers are from the small benchmark fixture on this repo's dev machine, not the real
+744B model — see `c/scripts/bench_repin.sh` for the tunables and the full-model
+equivalent under "Benchmark the full model" below.)
 
 **Conversations reopen warm** (`.coli_kv`, since 2026-07-10): `coli chat` persists the compressed MLA KV-cache to disk after every turn (~182 KB/token, appended incrementally, crash-safe). Close the chat, reopen it tomorrow — the model still remembers the whole conversation and **zero re-prefill happens**: validated byte-identical to an uninterrupted session. `:reset` clears it, `KVSAVE=0` disables it.
 
@@ -450,6 +507,17 @@ fixture generation: `pip install torch transformers safetensors`). With
 `qemu-user-static` installed it additionally proves the Ivy Bridge build
 actually runs under an emulated Ivy Bridge CPU while an AVX2 build SIGILLs
 under the same CPU model.
+
+That's all against synthetic random-weight fixtures, for speed. To check
+against the REAL model instead: `make verify-real-model` downloads just the
+real dense-resident prefix (embed/lm_head/norm + the first `first_k_dense_replace`
+transformer layers — a few GB, not the full 370 GB, since routed MoE experts
+are only ever streamed on demand and aren't needed to prove the loader/kernels
+work) from the real Hugging Face checkpoint, runs a real prompt through the
+real tokenizer with real int4/int8 weights, and asserts the AVX2/AVX-512 and
+Ivy Bridge builds produce byte-identical greedy output (`TEMP=0`) on that real
+data (`QEMU=1` additionally cross-checks under real Ivy Bridge emulation, ~15
+min on real-sized weights — see `c/scripts/verify_real_model.sh`).
 
 ### Benchmark the full model
 

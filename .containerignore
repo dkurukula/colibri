@@ -1,15 +1,12 @@
-# ambienti python / cache
+.git/
 c/mio_env/
 __pycache__/
 **/__pycache__/
 *.pyc
 web/node_modules/
 web/dist/
-web/*.tsbuildinfo
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
-
-# binari compilati (si rigenerano con make / coli build)
 c/glm
 c/olmoe
 c/iobench
@@ -21,8 +18,6 @@ c/tests/test_st
 c/tests/test_tier
 c/tests/test_repin
 c/tests/test_grammar
-
-# oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
 c/glm_tiny/
 c/glm_tiny_i2/
 c/glm_tiny_i4/
@@ -31,19 +26,6 @@ c/glm_bench_medium/
 c/bench/
 c/.bench_bins/
 c/.verify_bins/
-
-# pesi modello / artefatti di run
 *.safetensors
 stats*.txt
 *.log
-
-# script di ricerca stadio-0 (esperimenti locali, non parte del motore)
-/engine.py
-/run.py
-/validate_ref.py
-/s0_costmodel.py
-/s1_trace_hitrate.py
-/s2_research.py
-/quant_test.py
-/profile_run.py
-/sweep.py
