@@ -180,7 +180,13 @@ else
 CC      = gcc
 # ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
 # ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
-# ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
+# ARCH=ivybridge (o sandybridge) -> AVX senza AVX2/FMA (Sandy/Ivy Bridge, 2011-2012):
+#   i kernel matmul_q/i4/i2 e il dot intero (IDOT) usano percorsi vettoriali dedicati
+#   (AVX a 256 bit per i float, SSSE3 a 128 bit per l'intero) invece di ricadere
+#   sullo scalare puro -- verificato su hardware reale Ivy Bridge (Xeon E5-2660 v2).
+# ARCH=x86-64-v2 -> SSSE3/SSE4.2 senza AVX: il dot intero (IDOT) usa comunque SSSE3
+#   a 128 bit; i kernel matmul_q/i4/i2 (float) ricadono sullo scalare (serve AVX).
+# ARCH=x86-64 -> massima compatibilita' (niente SSSE3/AVX: tutto scalare).
 # -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
 ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
@@ -1113,6 +1119,11 @@ endif
 
 portable:
 	$(MAKE) colibri$(EXE) ARCH=$(PORTABLE_ARCH)
+
+# come 'portable', ma per CPU AVX senza AVX2/FMA (Sandy/Ivy Bridge e successive):
+# stessi kernel vettoriali (AVX float + SSSE3 intero), niente istruzioni AVX2/FMA.
+portable-avx:
+	$(MAKE) colibri$(EXE) ARCH=sandybridge
 
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
