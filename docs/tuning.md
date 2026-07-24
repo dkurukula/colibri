@@ -69,6 +69,15 @@ boundaries, a per-layer LFRU score combines decaying session frequency with rece
 access and replaces at most four sufficiently colder pinned experts. `--policy
 quality` leaves live replacement off by default; `REPIN=0` always disables it.
 
+The swap itself is gated on measured load, not just token count (concept from
+[arXiv:2607.10183 "ATSInfer"](https://arxiv.org/abs/2607.10183), Algorithm 3):
+`REPIN=n` stays the minimum check interval, but the engine only pays the disk
+cost of a swap once this turn's measured tok/s has drifted from a rolling
+per-slot baseline by more than `REPIN_EPS` (default `0.15`) — otherwise it just
+tracks the drift and rechecks later. This applies automatically wherever
+`REPIN` is already nonzero, including `--policy balanced`. `REPIN_EPS<=0`
+restores the old unconditional-every-N-tokens behavior.
+
 ## The learning cache
 
 The engine records which experts your usage actually routes to (`.coli_usage`

@@ -19,7 +19,7 @@ Configuration through environment variables or flags (also valid after the subco
                      are split across both SSDs (COLI_DISK_WEIGHTS=9,3 sets the
                      primary,mirror bandwidth ratio; default: measured at startup)
   --ram N            RAM budget in GB (automatically sizes the expert cache)
-  --repin N          adapt RAM/VRAM experts every N tokens
+  --repin N          adapt RAM/VRAM experts every N tokens (default: 64, on for chat/serve; --repin 0 disables)
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
@@ -228,7 +228,7 @@ def env_for(a):
     if a.topk: e["TOPK"]=str(a.topk)
     if a.temp is not None: e["COLI_TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
                                                         # COLI_TEMP, non TEMP: ROCm e Windows leggono $TEMP come dir temporanea (#509)
-    if a.repin: e["REPIN"]=str(a.repin)
+    if a.repin is not None: e["REPIN"]=str(a.repin)  # explicit --repin 0 must disable it, not fall through to the engine's own default
     if a.ctx: e["CTX"]=str(a.ctx)
     if a.auto_tier:
         from resource_plan import build_plan, environment_for_plan, format_bytes
@@ -971,7 +971,7 @@ def main():
     common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")
-    common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
+    common.add_argument("--repin", type=int, default=None, help="adapt RAM/VRAM experts every N tokens (default: 64, on for chat/serve; --repin 0 disables)")
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)

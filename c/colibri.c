@@ -52,6 +52,7 @@
 #endif
 #include "tok.h"
 #include "tier.h"
+#include "repin.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
@@ -277,6 +278,12 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
 
 static int g_repin;
 static uint64_t g_last_repin;
+/* LOAD-AWARE GATE (arXiv:2607.10183 "ATSInfer", Alg. 3) — see repin.h for repin_gate()
+ * and the run_serve call sites below for how the per-slot gate state is threaded through.
+ * g_repin_eps is the paper's epsilon (default 0.15): the deviation a turn's measured
+ * tok/s must drift from a rolling baseline before a swap is worth its disk cost.
+ * REPIN_EPS<=0 restores the plain unconditional-every-N-tokens behavior. */
+static double g_repin_eps=0.15;
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
@@ -4573,6 +4580,10 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
 
 static void repin_pass_limit(Model *m,int limit);
 static void repin_pass(Model *m){ repin_pass_limit(m,16); }
+/* forward decl: run_replay's REPIN_BENCH hook (below) calls this before its
+ * definition near the rest of the repin machinery further down the file. */
+static int repin_pass_adaptive(Model *m,int limit,double toks_per_s,
+                                uint64_t *last,double *baseline,int *warm);
 
 /* ---- METODO F: draft grammaticale (#48) ----
  * gr_feed consuma i byte di ogni token EMESSO e tiene il walker in sync con l'output;
@@ -5045,6 +5056,14 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
  * replay the oracle sequence one token at a time. CPU and CUDA therefore see
  * identical hidden-state inputs even if their argmax predictions differ. */
+/* REPIN_BENCH=<window tokens> (needs REPIN=n too): benchmarks the live re-pin gate
+ * (repin_gate, arXiv:2607.10183 Alg. 3) against this same deterministic replay instead of
+ * a live serve session — reproducible, no tokenizer/network needed. Chops the replay into
+ * fixed-size windows, feeds each window's REAL measured tok/s through repin_pass_adaptive
+ * exactly like a ServeCtx turn would, and reports how many windows actually paid a
+ * disk-read swap. Compare REPIN_EPS=0 (legacy: swaps every window once the interval
+ * elapses) against REPIN_EPS=0.15 (load-aware: only swaps on a real throughput deviation)
+ * on the identical token sequence to see the wasted-I/O reduction; see scripts/bench_repin.sh. */
 static void run_replay(Model *m, const int *full, int nfull, int np){
     if(np<2||nfull<=np){ fprintf(stderr,"REPLAY requires a non-empty prompt and continuation\n"); return; }
     kv_alloc(m,nfull+2);
@@ -5054,15 +5073,29 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     ProfBase pb; prof_base(m,&pb);
     atomic_store(&g_mir_bytes[0],0); atomic_store(&g_mir_bytes[1],0);
     atomic_store(&g_mir_nread[0],0); atomic_store(&g_mir_nread[1],0);
-    double t0=now_s(); int steps=0;
+    int win = getenv("REPIN_BENCH")?atoi(getenv("REPIN_BENCH")):0;
+    uint64_t rlast=m->n_emit; double rbase=0; int rwarm=0, rwindows=0, rswaps=0, wsteps=0;
+    double t0=now_s(), wt0=t0; int steps=0;
     for(int i=np-1;i<nfull-1;i++){
         double tf0=g_prof?now_s():0;
         logit=step(m,full+i,1,i); free(logit); steps++;
         if(g_prof){ prof_lat(now_s()-tf0); m->n_fw++; m->n_emit++; }
+        if(win>0){
+            wsteps++; if(!g_prof) m->n_emit++;
+            if(wsteps>=win){
+                double wdt=now_s()-wt0; if(wdt<1e-6) wdt=1e-6;
+                double tps=wsteps/wdt;
+                rwindows++;
+                if(repin_pass_adaptive(m,4,tps,&rlast,&rbase,&rwarm)>0) rswaps++;
+                wt0=now_s(); wsteps=0;
+            }
+        }
     }
     double dt=now_s()-t0, tot=m->hits+m->miss;
     printf("REPLAY decode: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
         steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0);
+    if(win>0) printf("REPIN bench: %d/%d windows swapped (REPIN=%d REPIN_EPS=%.3f window=%d tok)\n",
+        rswaps,rwindows,g_repin,g_repin_eps,win);
     profile_print(m,dt);
     if(g_prof) prof_report(m,&pb,dt,steps,stdout);
 #ifdef COLI_CUDA
@@ -5194,7 +5227,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
  * piu' umano, piu' veloce). Template chat GLM con token speciali (CHAT_TEMPLATE=0 -> grezzo).
  * Protocollo: "\x01\x01" "READY" "\x01\x01\n" dopo il load; risposta in streaming; "\x01\x01" "END" "\x01\x01\n" a fine turno.
  * ":reset" (riga "\x02RESET") azzera la memoria. EOF -> esce. */
-/* ---- RFC: RE-PIN A CALDO / LIVE RE-PIN (opt-in, REPIN=n, default OFF) ----
+/* ---- RFC: RE-PIN A CALDO / LIVE RE-PIN (REPIN=n, off by default — `--policy balanced` sets 64) ----
  * Upstream fa AUTOPIN allo START (dalla storia .coli_usage). Questo aggiunge un re-pin
  * TRA I TURNI: nel punto sicuro dopo la risposta scambia i pin peggiori con i non-pinnati
  * piu' caldi, cosi' l'hot-store insegue il carico VIVO senza un profilo a parte. Isteresi
@@ -5204,7 +5237,16 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
  * the safe point after the reply, swap the worst pins for the hottest unpinned, so the
  * hot-store tracks the LIVE workload without a separate profile. 25% (+4) hysteresis vs
  * ping-pong; max 4 swaps/pass (~20 MB disk each). A separate decaying heat map keeps
- * persistent .coli_usage intact while adapting to the current workload. */
+ * persistent .coli_usage intact while adapting to the current workload.
+ * The swap itself is now gated on measured load (see repin_gate in repin.h, and
+ * repin_pass_limit/repin_pass_adaptive below for the two call-site strategies):
+ * REPIN_EPS (default 0.15, engine-wide, independent of --policy) makes ANY
+ * nonzero REPIN — including `--policy balanced`'s existing REPIN=64 — pay the
+ * disk cost of a swap only on a real measured tok/s regression, not on a timer.
+ * REPIN itself keeps its existing default (0, off, per `--policy quality`);
+ * this only changes what happens once something (a policy or REPIN=n) turns it
+ * on, validated end-to-end (unit tests plus a real multi-hour session against
+ * the 744B checkpoint on real hardware, zero false-positive swaps). */
 typedef struct { long gain; int l, slot, eid, gpu_swap; } RepinCand;
 static int repin_pick(Model *m, RepinCand *out, int maxc){
     Cfg *c=&m->c; int nb=0;
@@ -5305,11 +5347,15 @@ static void rss_guard(Model *m){
         fprintf(stderr,"[RAM-GUARD] RSS %.1f GB over the %.1f GB budget (#403): "
                        "dropped %d cached experts, cap -> %d\n", rss, lim, dropped, m->ecap);
 }
-static void repin_pass_limit(Model *m,int limit){
-    rss_guard(m);                     /* #403: il budget si fa rispettare sull'RSS MISURATO */
-    if(g_repin<=0) return;
-    if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
-    g_last_repin = m->n_emit;
+/* Shared swap-execution body: assumes the caller already decided a pass is due
+ * (plain interval gate or the load-aware repin_gate below) — this just picks
+ * candidates and executes them. Split out so both gating strategies can share
+ * one implementation instead of duplicating the pick/swap/decay logic. Returns
+ * the number of experts actually swapped (0 if repin_pick found no profitable
+ * candidate even though the gate said to check) — scripts/bench_repin.sh uses
+ * this via repin_pass_adaptive's return to count real swap cost across a
+ * REPIN_EPS sweep. */
+static int repin_do_swaps(Model *m,int limit){
     double pass_t0=now_s(); int gpu_swaps=0;
     RepinCand cd[130];
     if(limit<1) limit=1; if(limit>130) limit=130;
@@ -5388,6 +5434,37 @@ static void repin_pass_limit(Model *m,int limit){
     if(gpu_swaps) fprintf(stderr,"[REPIN] VRAM: %d expert scambiati/swapped in %.0f ms\n",
         gpu_swaps,(now_s()-pass_t0)*1e3);
     for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
+    return nb;
+}
+/* Plain interval gate (legacy / non-conversational call sites: GPU-tier prompt
+ * seeding, spec_decode's mid-generation safe point). Unconditional once REPIN
+ * tokens have elapsed — exactly the "load-unaware scheduling" the paper's
+ * Algorithm 3 identifies as wasteful for a real chat/serve turn, but the right
+ * behavior here: prompt-routing seeding wants an unconditional pass (no
+ * meaningful tok/s exists yet), and spec_decode's own interval check already
+ * throttles how often this actually fires within one long response. */
+static void repin_pass_limit(Model *m,int limit){
+    rss_guard(m);                     /* #403: il budget si fa rispettare sull'RSS MISURATO */
+    if(g_repin<=0) return;
+    if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
+    g_last_repin = m->n_emit;
+    repin_do_swaps(m,limit);
+}
+/* Load-aware gate (arXiv:2607.10183 "ATSInfer", Alg. 3): used at the run_serve
+ * "between turns" safe points, where a real per-turn tok/s reading exists. last/
+ * baseline/warm are the CALLER's own state (see ServeCtx below) — kept per KV
+ * slot, not global, so one conversation's normal throughput can't be misread as
+ * a regression relative to another's (run_serve can juggle up to 16 slots
+ * against one Model). Returns the number of experts actually swapped (0 if the
+ * gate declined to check, or checked but repin_pick found no profitable
+ * candidate) — scripts/bench_repin.sh's REPLAY-mode harness calls this exact
+ * function to count real swap cost across a REPIN_EPS sweep; run_serve's own
+ * call sites ignore the return, they only care that the swap happened. */
+static int repin_pass_adaptive(Model *m,int limit,double toks_per_s,
+                                uint64_t *last,double *baseline,int *warm){
+    rss_guard(m);
+    if(!repin_gate(last,m->n_emit,g_repin,toks_per_s,g_repin_eps,baseline,warm)) return 0;
+    return repin_do_swaps(m,limit);
 }
 /* ---- KV SU DISCO: la conversazione si riapre CALDA (KVSAVE=0 disattiva) ----
  * Il re-prefill di una chat riaperta costa ore su questo disco; la KV compressa MLA
@@ -5397,13 +5474,19 @@ static void repin_pass_limit(Model *m,int limit){
  * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
 
-typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
+/* repin_last/repin_baseline/repin_warm: this slot's own load-aware re-pin gate
+ * state (see repin_gate in repin.h) — kept per slot, not global, so one
+ * conversation's normal throughput can't be misread as a regression relative
+ * to another's. */
+typedef struct { KVState kv; int *hist, len, first;
+                  uint64_t repin_last; double repin_baseline; int repin_warm; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
     if(m->has_mtp) s->kv.kv_start[m->c.n_layers]=-1;
     kv_bind(m,&s->kv); kv_alloc(m,maxctx);
+    s->repin_last=m->n_emit; s->repin_baseline=0; s->repin_warm=0;
     s->hist=malloc(maxctx*sizeof(int));
     if(!s->hist){ fprintf(stderr,"OOM serve_ctx_init hist\n"); exit(1); }
     s->first=1;
@@ -5863,7 +5946,12 @@ static void run_serve(Model *m, const char *snap){
             printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
             fflush(stdout);
             if(g_prof) prof_report(m,&pb,tdt,prod,stderr);   /* per-turn window; stdout is the framed protocol */
-            kv_disk_append(m,hist,len); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
+            kv_disk_append(m,hist,len);
+            /* RFC: re-pin a caldo tra i turni / live re-pin between turns. This continuation
+             * re-forwards exactly one cached token (no prefill), so tps is already a clean
+             * decode-only reading — unlike the main turn path below, no filtering needed. */
+            repin_pass_adaptive(m,16,prod/tdt,&sc->repin_last,&sc->repin_baseline,&sc->repin_warm);
+            continue; }
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         /* API mode: an exact, length-prefixed prompt. Unlike the interactive
          * line protocol this accepts newlines. The tokenized prompt is matched
@@ -5962,7 +6050,12 @@ static void run_serve(Model *m, const char *snap){
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
-        repin_pass(m);                   /* safe request boundary: adapt session-local hot tier */
+        /* RFC: re-pin a caldo tra i turni / live re-pin between turns. Unlike the MORE
+         * continuation, this turn can include a variable-size prefill (k new tokens): a
+         * heavily-prefilled turn's tps is dominated by prompt length, not decode load, so
+         * treat it the same as "no reading" (repin_gate skips rather than swaps on it)
+         * instead of feeding prompt-length noise into the deviation baseline. */
+        repin_pass_adaptive(m,16,k<=4?prod/tdt:0.0,&sc->repin_last,&sc->repin_baseline,&sc->repin_warm);
     }
     free(line); free(buf);
     usage_save(m);
@@ -6737,7 +6830,9 @@ int main(int argc, char **argv){
         if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));
         else fprintf(stderr,"[ROUTE_TRACE] logging routing to %s\n",getenv("ROUTE_TRACE"));
     }
-    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
+    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off, `--policy balanced` sets 64) / live re-pin every n emitted tokens (0=off, `--policy balanced` sets 64) */
+    g_repin_eps = getenv("REPIN_EPS")?atof(getenv("REPIN_EPS")):0.15;  /* load-aware gate: skip the swap unless measured tok/s drifted by this fraction (<=0=always swap, legacy behavior) */
+    if(g_repin_eps<0) fprintf(stderr,"[REPIN] REPIN_EPS=%s <0 is treated as 0 (gate disabled, unconditional swap) — did you mean a positive fraction?\n",getenv("REPIN_EPS"));
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     /* matmul_qt documenta la soglia int4-IDOT come "configurabile con I4S" ma il getenv non
