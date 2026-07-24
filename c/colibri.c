@@ -528,6 +528,34 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
                     accu=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1u, accu);
                 }
                 ag+=hsum256(accg)*scg; au+=hsum256(accu)*scu;
+#elif defined(__AVX__)
+                const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8i=_mm_set1_epi32(8);
+                __m256 accg=_mm256_setzero_ps(), accu=_mm256_setzero_ps();
+                for(; i+16<=base+glen; i+=16){
+                    __m128i byg=_mm_loadl_epi64((const __m128i*)(wg+(i>>1)));
+                    __m128i log=_mm_and_si128(byg,m4), hig=_mm_and_si128(_mm_srli_epi16(byg,4),m4);
+                    __m128i nibg=_mm_unpacklo_epi8(log,hig);
+                    __m128i n0ag=_mm_sub_epi32(_mm_cvtepu8_epi32(nibg),b8i);
+                    __m128i n0bg=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nibg,4)),b8i);
+                    __m128i n1ag=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nibg,8)),b8i);
+                    __m128i n1bg=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nibg,12)),b8i);
+                    __m256 w0g=_mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(n0ag)),_mm_cvtepi32_ps(n0bg),1);
+                    __m256 w1g=_mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(n1ag)),_mm_cvtepi32_ps(n1bg),1);
+                    accg=_mm256_add_ps(accg,_mm256_mul_ps(_mm256_loadu_ps(xs+i),   w0g));
+                    accg=_mm256_add_ps(accg,_mm256_mul_ps(_mm256_loadu_ps(xs+i+8), w1g));
+                    __m128i byu=_mm_loadl_epi64((const __m128i*)(wu2+(i>>1)));
+                    __m128i lou=_mm_and_si128(byu,m4), hiu=_mm_and_si128(_mm_srli_epi16(byu,4),m4);
+                    __m128i nibu=_mm_unpacklo_epi8(lou,hiu);
+                    __m128i n0au=_mm_sub_epi32(_mm_cvtepu8_epi32(nibu),b8i);
+                    __m128i n0bu=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nibu,4)),b8i);
+                    __m128i n1au=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nibu,8)),b8i);
+                    __m128i n1bu=_mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(nibu,12)),b8i);
+                    __m256 w0u=_mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(n0au)),_mm_cvtepi32_ps(n0bu),1);
+                    __m256 w1u=_mm256_insertf128_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(n1au)),_mm_cvtepi32_ps(n1bu),1);
+                    accu=_mm256_add_ps(accu,_mm256_mul_ps(_mm256_loadu_ps(xs+i),   w0u));
+                    accu=_mm256_add_ps(accu,_mm256_mul_ps(_mm256_loadu_ps(xs+i+8), w1u));
+                }
+                ag+=hsum256(accg)*scg; au+=hsum256(accu)*scu;
 #endif
                 for(; i+1<base+glen; i+=2){
                     uint8_t bg=wg[i>>1], bu=wu2[i>>1];
@@ -2670,6 +2698,12 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 for(;i+8<=kvl;i+=8)
                     acc=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+i), _mm256_loadu_ps(Lt+i), acc);
                 a=hsum256(acc);
+#elif defined(__AVX__)
+                /* Sandy/Ivy Bridge: AVX (256-bit float) but no FMA -- plain mul+add. */
+                __m256 acc=_mm256_setzero_ps();
+                for(;i+8<=kvl;i+=8)
+                    acc=_mm256_add_ps(acc,_mm256_mul_ps(_mm256_loadu_ps(qabs+i), _mm256_loadu_ps(Lt+i)));
+                a=hsum256(acc);
 #elif defined(__ARM_NEON)
                 float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
                 for(;i+8<=kvl;i+=8){
@@ -2694,6 +2728,12 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 for(;i+8<=kvl;i+=8){
                     __m256 cl=_mm256_loadu_ps(clat+i), lt=_mm256_loadu_ps(Lt+i);
                     _mm256_storeu_ps(clat+i, _mm256_fmadd_ps(va, lt, cl));
+                }
+#elif defined(__AVX__)
+                __m256 va=_mm256_set1_ps(a);
+                for(;i+8<=kvl;i+=8){
+                    __m256 cl=_mm256_loadu_ps(clat+i), lt=_mm256_loadu_ps(Lt+i);
+                    _mm256_storeu_ps(clat+i, _mm256_add_ps(cl,_mm256_mul_ps(va, lt)));
                 }
 #elif defined(__ARM_NEON)
                 float32x4_t va=vdupq_n_f32(a);
