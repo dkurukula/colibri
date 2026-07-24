@@ -102,6 +102,8 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 | Intel Core Ultra 9 185H (16C/22T, avx-vnni) · **native Windows 11, no WSL** · 32 GB · Crucial P3 QLC NTFS · RTX 5070 Ti ([#128](https://github.com/JustVugg/colibri/issues/128), [#273](https://github.com/JustVugg/colibri/issues/273)) | — | int8 MTP head · warm cache · GPU-resident pipeline at decode | 0.03 cold → 0.5 warm CPU → **1.07 tok/s** with the pipe2 decode gate (#274) |
 | Dell Pro Max GB10 (DGX Spark: Grace, **aarch64 i8mm/sve2**) · Linux · 121 GB unified LPDDR5x · GB10 sm_121 ([#136](https://github.com/JustVugg/colibri/issues/136), [#161](https://github.com/JustVugg/colibri/issues/161)) | **5.58 GB/s** O_DIRECT | int8 MTP head · warm cache | 0.50 tok/s warm · **2.4 tok/s full-k8**, **3.33 tok/s** with `CACHE_ROUTE` (#199) |
 | **6 × RTX 5090 · dual Xeon Silver 4510 · 251 GB** (author's rig, [experiment log](experiments/glm52-6x5090-2026-07-12.md)) | NVMe | `CUDA_EXPERT_GB=auto PIN_GB=all` full residency · `COLI_CUDA_PIPE=2 TC_W4A16` · DRAFT=0 | **5.8–6.8 tok/s** decode · TTFT ~13 s · hit 89–100% |
+| **Dell PowerEdge R720 · Linux · Ivy Bridge (AVX, no AVX2/FMA) · 134.6 GB RAM**, `ARCH=ivybridge` | — | `CAP_RAISE=0 ./coli run --ram 50 --cap 8` | 0.12 tok/s · expert hit 11.6% · RSS 24.54 GB |
+| 〃 quality benchmark | — | `./coli bench --ram 50 --cap 8` | `hellaswag` 30.0% acc / 50.0% acc_norm · `arc_challenge` 70.0% acc / 60.0% acc_norm · `mmlu` 50.0% acc / 50.0% acc_norm · **MEDIA acc_norm 53.3%** · score wall 16137s · RSS 22.02 GB · expert hit 1% · 120 requests / 16121.6s (~0.0074 req/s) |
 
 ### Takeaways
 
@@ -122,6 +124,13 @@ bandwidth from **42.42 to 58.26/65.89 GB/s** and greedy decode from **7.66 to
 9.02/9.17 tok/s** (64 tokens, `TEMP=0 DRAFT=0`, byte-identical output). Do not
 blanket-interleave a GPU host: it also spreads DMA staging pages and has measured
 up to a 10× regression; generated plans enable only the selective slab policy.
+The R720 rows are the real-hardware confirmation of the AVX/SSSE3 kernel tier
+for pre-AVX2 CPUs (see [docs/tuning.md "CPU tier"](tuning.md#cpu-tier-build-for-your-vector-isa)):
+`ARCH=ivybridge` vs. a build that falls through to scalar, same model/prompt/config,
+measured a real ~2× prefill and decode speedup on this machine — 134 GB of RAM
+couldn't lift the 1% expert hit-rate on the quality run because the benchmark
+harness sweeps one forward per answer option, a different access pattern from
+decode's single generation path.
 
 ## Quality benchmark
 

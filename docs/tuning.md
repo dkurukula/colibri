@@ -78,6 +78,32 @@ tracks the drift and rechecks later. This applies automatically wherever
 `REPIN` is already nonzero, including `--policy balanced`. `REPIN_EPS<=0`
 restores the old unconditional-every-N-tokens behavior.
 
+## CPU tier: build for your vector ISA
+
+`ARCH=` (passed to `make`, or `--arch` to `scripts/quickstart.sh`/`scripts/podman.sh`)
+selects the `-march` value the quantized matmul and integer IDOT kernels
+compile against:
+
+| CPU | build | matmul kernel | IDOT kernel |
+|---|---|---|---|
+| Haswell+ (2013+), AVX2/FMA | `make` (`ARCH=native`, default) | AVX2 FMA | avx2 |
+| Alder Lake+/Zen4+, AVX-VNNI | `make` (`ARCH=native` on that CPU) | AVX2 FMA | avx-vnni |
+| Skylake-X+, AVX-512 VNNI | `make` (`ARCH=native` on that CPU) | AVX2 FMA | avx512-vnni |
+| **Sandy/Ivy Bridge (2011-2012), AVX only** | `make ARCH=ivybridge` | AVX (no FMA) | ssse3 |
+| SSSE3/SSE4.2 without AVX | `make ARCH=x86-64-v2` | scalar | ssse3 |
+| Anything older (SSE-only) | `make ARCH=x86-64` | scalar | scalar |
+
+Without a CPU-appropriate `ARCH`, a pre-AVX2 machine silently gets the slower
+kernel tier instead of failing outright — check the boot banner's `idot: ...`
+field, or build with the wrong tier and compare. Measured on a Xeon E5-2660 v2
+("Ivy Bridge", no AVX2/FMA, confirmed via `/proc/cpuinfo`) with the real
+744B GLM-5.2 model, identical prompt and config: `ARCH=ivybridge` (idot: ssse3)
+vs. a build that falls through to the scalar path (idot: scalar) — prefill
+118.78s → 58.70s, decode 73.42s → 31.91s for 2 tokens, expert-matmul effective
+bandwidth 1.08 → 3.20 GB/s (prefill) and 0.89 → 3.10 GB/s (decode). `make
+portable-avx` (`ARCH=sandybridge`) builds a binary to distribute to any
+AVX-only machine, mirroring `make portable`'s `ARCH=x86-64-v3` for AVX2 hosts.
+
 ## The learning cache
 
 The engine records which experts your usage actually routes to (`.coli_usage`
