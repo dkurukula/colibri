@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# GLM-5.2 conversion supervisor — resilient to WSL's network stalling.
-#  - always keeps exactly ONE converter alive
-#  - if a download sits STILL for >180s (zombie connection), kills and restarts it:
-#    hf_hub resumes the .incomplete from the exact byte, nothing is lost
-#  - exits by itself once all 141 shards are done
-# usage from c/:  nohup scripts/supervisor.sh > supervisor.log 2>&1 &
+# Supervisore della conversione GLM-5.2 — a prova di rete WSL che si blocca.
+#  - tiene SEMPRE vivo un (solo) convertitore
+#  - se un download resta FERMO >180s (connessione zombie), lo ammazza e lo rilancia:
+#    hf_hub riprende il .incomplete dal punto esatto, non si perde nulla
+#  - esce da solo quando tutti i 141 shard sono fatti
+# uso da c/:  nohup scripts/supervisor.sh > supervisor.log 2>&1 &
 set -u
 DIR="${COLI_MODEL:-/home/vincenzo/glm52_i4}"
 CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOTAL="${TOTAL_SHARDS:-141}"
-STALL_S=180          # seconds without download growth -> restart
+STALL_S=180          # secondi senza crescita del download -> riavvio
 CONVLOG=/tmp/convert_supervised.log
 
 exec 9>"$DIR/.supervisor.lock"
-flock -n 9 || { echo "supervisor already running, exiting"; exit 1; }
+flock -n 9 || { echo "a supervisor is already running; exiting"; exit 1; }
 
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
 
@@ -30,7 +30,7 @@ while :; do
     if [ "$done_n" -ge "$TOTAL" ]; then log "DONE: $done_n/$TOTAL shards. Exiting."; pkill -f convert_fp8 2>/dev/null; exit 0; fi
 
     if ! pgrep -f convert_fp8 >/dev/null; then
-        log "converter not running ($done_n/$TOTAL): starting it"
+        log "converter is not running ($done_n/$TOTAL): starting it"
         start_conv; last_size=-1; stall=0; sleep 20; continue
     fi
 
@@ -40,7 +40,7 @@ while :; do
         if [ "$size" = "$last_size" ]; then
             stall=$((stall+30))
             if [ "$stall" -ge "$STALL_S" ]; then
-                log "download STALLED for ${stall}s at $((size/1000000)) MB ($done_n/$TOTAL): restarting the converter"
+                log "download stalled for ${stall}s at $((size/1000000)) MB ($done_n/$TOTAL): restarting the converter"
                 pkill -f convert_fp8; sleep 5
                 start_conv; last_size=-1; stall=0
             fi
@@ -49,7 +49,7 @@ while :; do
             last_size=$size; stall=0
         fi
     else
-        last_size=-1; stall=0     # no .incomplete = converting/saving: all good
+        last_size=-1; stall=0     # niente .incomplete = sta convertendo/salvando: tutto ok
     fi
     sleep 30
 done

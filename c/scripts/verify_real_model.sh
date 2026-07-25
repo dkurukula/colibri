@@ -6,7 +6,7 @@
 # The full checkpoint is ~370 GB, too large to fetch just to sanity-check the
 # loader/kernels. Since colibri loads embed/lm_head/attention/dense-FFN/router/
 # shared-experts fully resident at startup and only streams routed MoE experts
-# lazily at inference time (see model_init in glm.c), a real model with
+# lazily at inference time (see model_init in colibri.c), a real model with
 # num_hidden_layers truncated down to first_k_dense_replace needs NO routed
 # expert tensors at all — just the dense-resident set for those layers. That's
 # a real, complete, runnable (if artificially short) slice of the real model,
@@ -85,8 +85,8 @@ json.dump(c,open(p,'w'))
 declare -A OUT
 for arch in "${ARCHES[@]}"; do
     log "[build] ARCH=$arch"
-    make -s glm ARCH="$arch"
-    mv glm "$BIN_DIR/glm-$arch"
+    make -s colibri ARCH="$arch"
+    mv colibri "$BIN_DIR/glm-$arch"
     log "[run] ARCH=$arch"
     out=$(PROMPT="$PROMPT" NGEN="$NGEN" TEMP=0 SNAP="$DIR" RAM_GB=6 CTX=256 "$BIN_DIR/glm-$arch" 4 8 8 2>&1)
     kernel=$(printf '%s\n' "$out" | grep -oE 'idot: [a-z0-9-]+' | head -1)
@@ -113,8 +113,8 @@ done
 if [ "$QEMU" = 1 ] && command -v qemu-x86_64-static >/dev/null 2>&1; then
     log ""
     log "=== qemu-user -cpu IvyBridge on real weights (slow: no JIT for AVX-heavy loops) ==="
-    make -s glm ARCH=ivybridge; mv glm "$BIN_DIR/glm-ivybridge"
-    make -s glm ARCH=x86-64-v3; mv glm "$BIN_DIR/glm-x86-64-v3"
+    make -s colibri ARCH=ivybridge; mv colibri "$BIN_DIR/glm-ivybridge"
+    make -s colibri ARCH=x86-64-v3; mv colibri "$BIN_DIR/glm-x86-64-v3"
     if OMP_NUM_THREADS=1 PROMPT="$PROMPT" NGEN=1 TEMP=0 SNAP="$DIR" RAM_GB=6 CTX=64 \
         qemu-x86_64-static -cpu IvyBridge "$BIN_DIR/glm-x86-64-v3" 4 8 8 >/tmp/qemu_v3_real.log 2>&1; then
         log "FAIL: AVX2 build did NOT SIGILL under emulated Ivy Bridge (expected — AVX2 isn't in Ivy Bridge)"; PASS=0

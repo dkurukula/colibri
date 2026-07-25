@@ -1,11 +1,11 @@
-.PHONY: all glm portable portable-avx test check cuda-test clean bench-cpu-tiers bench-repin verify-real-model quickstart podman-build podman-chat podman-serve podman-run podman-plan podman-bench
+.PHONY: all glm portable portable-avx test check cuda-test clean install uninstall bench-cpu-tiers quickstart podman-build podman-chat podman-serve podman-run podman-plan podman-bench
 
-all glm portable portable-avx test check cuda-test clean bench-cpu-tiers bench-repin verify-real-model quickstart:
+all glm portable portable-avx test check cuda-test clean install uninstall bench-cpu-tiers quickstart:
 	$(MAKE) -C c $@
 
-# Default, easiest way to run colibrì: builds the podman image (once) and runs
-# the engine inside it. See c/scripts/podman.sh for tunables (ARCH, RAM_GB,
-# REPIN, REPIN_EPS, PORT, REBUILD=1) and README "Run it in podman".
+# Automated alternative to docker/'s manual build+run guide: builds the podman
+# image (once) and runs colibrì inside it. See c/scripts/podman.sh for tunables
+# (ARCH, RAM_GB, REPIN, REPIN_EPS, PORT, REBUILD=1).
 podman-build:
 	bash c/scripts/podman.sh --build-only
 

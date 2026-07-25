@@ -18,12 +18,15 @@ import os, sys, shutil
 from huggingface_hub import snapshot_download, HfApi
 
 REPO = "zai-org/GLM-5.2-FP8"
+# Pin the model revision for supply-chain integrity: set GLM_REVISION to a commit SHA
+# so a mutated/compromised upstream can't silently swap the weights you fetch.
+REVISION = os.environ.get("GLM_REVISION", "main")
 DEST = os.environ.get("GLM_DIR", "/home/vincenzo/glm52")   # su ext4 (/dev/sdd), MAI su /mnt/c
 
 def human(n): return f"{n/1e9:.0f} GB"
 
 def check():
-    info = HfApi().repo_info(REPO, files_metadata=True)
+    info = HfApi().repo_info(REPO, revision=REVISION, files_metadata=True)
     tot = sum((s.size or 0) for s in info.siblings)
     sts = [s for s in info.siblings if s.rfilename.endswith(".safetensors")]
     free = shutil.disk_usage(os.path.dirname(DEST) or "/").free
@@ -31,20 +34,21 @@ def check():
     print(f"  total files: {len(info.siblings)} ({len(sts)} safetensors shards)")
     print(f"  total size: {human(tot)}")
     print(f"  free space in {DEST}: {human(free)}")
-    print(f"  {'OK: fits' if free > tot*1.05 else 'WARNING: insufficient space'}")
+    print(f"  {'OK: enough space' if free > tot*1.05 else 'WARNING: not enough space'}")
 
 def download():
     os.makedirs(DEST, exist_ok=True)
     free = shutil.disk_usage(DEST).free
     print(f"Downloading {REPO} -> {DEST}  (free: {human(free)})")
-    # resume_download is implicit; if interrupted, rerun and it resumes.
+    # resume_download e' implicito; in caso di interruzione, rilancia e riprende.
     snapshot_download(
         repo_id=REPO,
+        revision=REVISION,
         local_dir=DEST,
         allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model"],
         max_workers=8,
     )
-    print("DONE. Weights in:", DEST)
+    print("DONE. Weights saved in:", DEST)
 
 if __name__ == "__main__":
     if "--check" in sys.argv:

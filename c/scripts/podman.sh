@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command podman path: builds the image once, then runs colibrì inside it —
-# no more hand-writing `podman run -v ... -e ... image chat`. This is the
-# recommended default way to run colibrì; see README "Run it in podman".
+# no more hand-writing `podman run -v ... -e ... image chat`. A more automated
+# alternative to docker/'s manual guide; see README "Run it in podman".
 #
 # Usage (from repo root or c/):
 #   COLI_MODEL=/nvme/glm52_i4 scripts/podman.sh chat
@@ -12,9 +12,10 @@
 # Tunables (env):
 #   COLI_MODEL   model directory on the HOST (required for chat/serve/run/plan/bench)
 #   IMAGE        image tag (default localhost/colibri:latest)
-#   ARCH         CPU tier to build for (default native; see bench_cpu_tiers.sh for the list)
+#   ARCH         CPU tier to build for (default native; see docs/tuning.md for the list)
 #   RAM_GB       RAM budget passed through to the engine (default: engine auto-sizes it)
-#   REPIN        override the live re-pin interval (default: engine's own default, 64; 0=off)
+#   REPIN        live re-pin interval in emitted tokens (default: engine's own default, 0=off;
+#                `--policy balanced` sets 64)
 #   REPIN_EPS    override the re-pin gate's deviation threshold (default: engine's own, 0.15)
 #   PORT         port to publish for `serve` (default 8000)
 #   REBUILD=1    force a rebuild even if the image already exists
@@ -37,7 +38,7 @@ fi
 
 build
 
-[ -n "${COLI_MODEL:-}" ] || { echo "COLI_MODEL is not set — point it at your downloaded model directory (see 'make quickstart')." >&2; exit 1; }
+[ -n "${COLI_MODEL:-}" ] || { echo "COLI_MODEL is not set — point it at your downloaded model directory (see docs/quickstart.md)." >&2; exit 1; }
 [ -d "$COLI_MODEL" ] || { echo "COLI_MODEL=$COLI_MODEL does not exist" >&2; exit 1; }
 
 PORT_ARGS=()

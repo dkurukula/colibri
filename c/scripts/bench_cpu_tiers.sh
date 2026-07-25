@@ -3,7 +3,7 @@
 #   native (AVX-512 VNNI on this host) / x86-64-v3 (AVX2+FMA) /
 #   ivybridge (AVX only + SSSE3, no AVX2/FMA — Sandy/Ivy Bridge) / x86-64 (scalar).
 #
-# The AVX-only kernels added for Ivy Bridge (see README "CPU tier") must never
+# The AVX-only kernels added for Ivy Bridge (see docs/tuning.md "CPU tier") must never
 # change what the engine computes, only how fast. This script proves that on
 # every run: it builds all four tiers, runs the SAME full engine turn (prefill
 # + real autoregressive decode, teacher-forcing prefill at f32/int8/int4) on
@@ -58,8 +58,8 @@ BENCH_REF="$CODE/glm_bench_medium/ref_glm.json"
 mkdir -p "$BIN_DIR"
 for arch in "${TIERS[@]}"; do
     log "[build] ARCH=$arch"
-    make -s glm ARCH="$arch"
-    mv glm "$BIN_DIR/glm-$arch"
+    make -s colibri ARCH="$arch"
+    mv colibri "$BIN_DIR/glm-$arch"
 done
 
 # ---------- 3) correctness: every tier must produce IDENTICAL output ----------
@@ -68,7 +68,7 @@ done
 # content: match counts against the oracle and the actual predicted/generated
 # token ids. If that signature differs between tiers, the AVX-only kernels
 # computed something different from AVX2/scalar — a real bug.
-signature(){ grep -E "^PREFILL|^\[ORACLE\]|^Motore C GLM|^Token coincidenti" | sed -E 's/\| [0-9.]+ pos\/s//'; }
+signature(){ grep -E "^PREFILL|^\[ORACLE\]|^GLM C engine|^Matching tokens" | sed -E 's/\| [0-9.]+ pos\/s//'; }
 
 # Weaker signature: keeps only the match-COUNT against the oracle, drops which
 # specific (already-wrong) token id was predicted. At int4 some internal
@@ -78,7 +78,7 @@ signature(){ grep -E "^PREFILL|^\[ORACLE\]|^Motore C GLM|^Token coincidenti" | s
 # last bit differently. That is expected, unavoidable floating-point
 # non-associativity, not a bug: it can only ever flip an already-wrong,
 # knife-edge argmax at extreme (int4) quantization, never the match-count.
-count_signature(){ grep -oE '[0-9]+/[0-9]+ posizioni|Token coincidenti: [0-9]+/[0-9]+'; }
+count_signature(){ grep -oE '[0-9]+/[0-9]+ positions|Matching tokens: [0-9]+/[0-9]+'; }
 
 check_case(){
     local desc="$1" snap="$2" ref_env="$3" extra_env="$4" args="$5"

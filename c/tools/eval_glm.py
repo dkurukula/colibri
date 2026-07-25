@@ -22,7 +22,7 @@ USO:
   # leve di ricerca: passate al motore via env
   TOPP=0.9 python3 tools/eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench --tasks mmlu --ram 15
 """
-import os, sys, subprocess, argparse, random, json, tempfile, time
+import os, sys, subprocess, argparse, random, json, tempfile, time, threading
 
 # mini-set OFFLINE per testare la meccanica (NON misura qualita': domande banali)
 SMOKE = [
@@ -43,16 +43,29 @@ def load_docs(task, data_dir, limit, seed):
         return SMOKE[:limit] if limit else SMOKE
     path = os.path.join(data_dir, task + ".jsonl")
     if not os.path.exists(path):
-        sys.exit(f"manca {path} — generalo con: python3 tools/fetch_benchmarks.py --out {data_dir} --tasks {task}")
+        sys.exit(f"missing {path} — generate it with: python3 tools/fetch_benchmarks.py --out {data_dir} --tasks {task}")
     docs = [json.loads(l) for l in open(path) if l.strip()]
     random.Random(seed).shuffle(docs)
     return docs[:limit] if limit else docs
 
-def build_requests(tk, docs_by_task):
+def detect_prefix(snap):
+    """GLM sees [gMASK]<sop> at the start of every training sequence; scoring raw text
+    without it is out-of-distribution and silently depresses/distorts scores (#108).
+    Default the prefix ON for GLM snapshots; EVAL_PREFIX (even empty) overrides."""
+    if "EVAL_PREFIX" in os.environ: return os.environ["EVAL_PREFIX"]
+    try: mt = json.load(open(os.path.join(snap, "config.json"))).get("model_type", "")
+    except Exception: mt = ""
+    if "glm" in mt.lower():
+        print("[prefix] GLM snapshot: prepending [gMASK]<sop> to every context "
+              "(override with EVAL_PREFIX, disable with EVAL_PREFIX=)", file=sys.stderr)
+        return "[gMASK]<sop>"
+    return ""
+
+def build_requests(tk, docs_by_task, prefix=""):
     reqs, meta, perq = [], [], {}
     for t, docs in docs_by_task.items():
         for qi, d in enumerate(docs):
-            ctx, conts, gold = d["ctx"], d["choices"], int(d["gold"])
+            ctx, conts, gold = prefix + d["ctx"], d["choices"], int(d["gold"])
             ctx_ids = tk.encode(ctx).ids
             for oi, cont in enumerate(conts):
                 full = tk.encode(ctx + cont).ids
@@ -86,7 +99,7 @@ def score_accuracy(tasks, meta, perq, lp):
         for mdl, sc in REFERENCE.get(t, {}).items():
             if sc is not None: print(f"{'  ref '+mdl:<18} {'':>4} {'':>7} {sc:>8.1f}%")
     if overall:
-        print(f"\nAVERAGE acc_norm: {sum(overall)/len(overall):.1f}% across {len(overall)} tasks")
+        print(f"\nMEAN acc_norm: {sum(overall)/len(overall):.1f}% across {len(overall)} tasks")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -99,8 +112,9 @@ def main():
     ap.add_argument("--cap", type=int, default=64)
     ap.add_argument("--bits", default="")
     ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--dry", action="store_true", help="build the requests and stop (no engine)")
-    ap.add_argument("--selftest", action="store_true", help="verify the scoring math")
+    ap.add_argument("--dry", action="store_true", help="build requests and stop without running the engine")
+    ap.add_argument("--selftest", action="store_true", help="verify the scoring calculations")
+    ap.add_argument("--out", default="", help="write incremental results CSV here (one row per request, flushed as it lands)")
     a = ap.parse_args()
 
     if a.selftest:                                   # acc/acc_norm con logprob sintetici
@@ -115,30 +129,80 @@ def main():
     docs_by_task = {t: load_docs(t, a.data, a.limit, a.seed) for t in tasks}
     for t, d in docs_by_task.items(): print(f"[{t}] {len(d)} questions", file=sys.stderr)
 
-    reqs, meta, perq = build_requests(tk, docs_by_task)
-    print(f"total requests: {len(reqs)} (options)", file=sys.stderr)
+    reqs, meta, perq = build_requests(tk, docs_by_task, detect_prefix(a.snap))
+    print(f"total requests: {len(reqs)} (answer options)", file=sys.stderr)
     if a.dry:
-        for r in reqs[:3]: print("  example req:", r[:80], "...", file=sys.stderr)
-        print("DRY: mechanics ok (tokenization+requests). No engine run.", file=sys.stderr); return
+        for r in reqs[:3]: print("  example request:", r[:80], "...", file=sys.stderr)
+        print("DRY: request construction and tokenization passed. Engine was not run.", file=sys.stderr); return
 
-    req_path = tempfile.mktemp(suffix=".txt")
-    open(req_path, "w").write("\n".join(reqs) + "\n")
+    # mkstemp (non mktemp): crea il file atomicamente con permessi 0600, niente
+    # race TOCTOU/symlink su una tmp dir condivisa (CWE-377).
+    fd, req_path = tempfile.mkstemp(suffix=".txt")
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(reqs) + "\n")
     env = dict(os.environ, SNAP=a.snap, SCORE=req_path)
     if a.ram: env["RAM_GB"] = str(a.ram)
     cmd = [a.glm, str(a.cap)] + a.bits.split()
     print("running:", " ".join(cmd), file=sys.stderr)
+
+    # Stream results line-by-line so a crash at request N keeps 1..N-1 and shows
+    # exactly where it stopped. The engine prints "<lp> <contlen> <greedy>" per
+    # request to stdout and "[score N req | ...]" progress to stderr; buffering
+    # both until exit (the old subprocess.run) wastes the whole run on a crash.
+    out_f = open(a.out, "a") if a.out else None
+    if out_f:
+        out_f.write(f"# eval_glm snap={a.snap} tasks={a.tasks} limit={a.limit} seed={a.seed} started={time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+        out_f.write("req_idx,task,qi,oi,contlen,contchars,gold,logprob,greedy\n")
+        out_f.flush()
     t0 = time.time()
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if proc.returncode != 0:
-        print("ENGINE ERROR:\n", proc.stderr[-2000:], file=sys.stderr); sys.exit(1)
-    lines = [l for l in proc.stdout.strip().splitlines() if l and l[0] in "-0123456789"]
-    if len(lines) != len(reqs):
-        print(f"WARNING: {len(lines)} outputs vs {len(reqs)} requests", file=sys.stderr)
-    lp = [float(l.split()[0]) for l in lines]
-    print(f"(engine: {time.time()-t0:.0f}s){proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else ''}", file=sys.stderr)
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, bufsize=1)  # line-buffered
+    lp = [None] * len(reqs)
+    n_done = 0
+    # Drain stderr (engine progress lines) to console live on a background thread
+    # so the [score N req] heartbeat is visible while stdout is consumed below.
+    def _drain_stderr():
+        for line in proc.stderr:
+            print(f"  [engine] {line.rstrip()}", file=sys.stderr)
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+    for line in proc.stdout:
+        line = line.strip()
+        if not line or line[0] not in "-0123456789": continue
+        parts = line.split()
+        if n_done >= len(reqs): break
+        try: logprob = float(parts[0])
+        except (ValueError, IndexError): continue
+        lp[n_done] = logprob
+        greedy = parts[2] if len(parts) > 2 else "?"
+        t, qi, oi, clen, cchars, gold = meta[n_done]
+        if out_f:
+            out_f.write(f"{n_done},{t},{qi},{oi},{clen},{cchars},{gold},{logprob:.6f},{greedy}\n")
+            out_f.flush()
+        n_done += 1
+        if n_done % 5 == 0 or n_done == len(reqs):
+            elapsed = time.time() - t0
+            rate = n_done / elapsed if elapsed > 0 else 0
+            eta = (len(reqs) - n_done) / rate if rate > 0 else 0
+            print(f"[progress] {n_done}/{len(reqs)} requests scored | {elapsed:.0f}s elapsed | "
+                  f"{rate:.2f} req/s | ETA {eta:.0f}s | last: {t} q{qi} opt{oi} lp={logprob:.3f}",
+                  file=sys.stderr)
+    proc.wait()
+    elapsed = time.time() - t0
+    if out_f:
+        out_f.write(f"# finished: {n_done}/{len(reqs)} in {elapsed:.0f}s, exit={proc.returncode}\n")
+        out_f.close()
+    if proc.returncode != 0 and n_done == 0:
+        print(f"ENGINE ERROR (exit {proc.returncode})", file=sys.stderr); sys.exit(1)
+    if n_done != len(reqs):
+        print(f"WARNING: only {n_done}/{len(reqs)} requests scored (engine exited {proc.returncode}); "
+              f"scoring partial results.", file=sys.stderr)
+    # Fill any unscored slots with -inf so argmax never picks them
+    for i in range(len(lp)):
+        if lp[i] is None: lp[i] = float("-inf")
+    print(f"(engine: {elapsed:.0f}s, {n_done}/{len(reqs)} scored, exit {proc.returncode})", file=sys.stderr)
     score_accuracy(tasks, meta, perq, lp)
-    print("\nNOTE: compare acc_norm against GLM-5.2's PUBLISHED score (model card). If close,"
-          "\n      int4 quantization preserved the model. (fill in REFERENCE in tools/eval_glm.py)")
+    print("\nNOTE: compare acc_norm with GLM-5.2's PUBLISHED model-card score. A close result"
+          "\n      indicates that int4 quantization preserved quality. (Fill REFERENCE in tools/eval_glm.py.)")
     os.remove(req_path)
 
 if __name__ == "__main__":

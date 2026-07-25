@@ -2,6 +2,7 @@
 """Read-only installation diagnostics for colibri."""
 
 import os
+import sys
 import json
 import subprocess
 from pathlib import Path
@@ -18,16 +19,33 @@ def _check(identifier, status, summary, **details):
 
 def cuda_linkage(engine_path):
     """Return CUDA linkage state without loading the executable or CUDA runtime."""
-    if not Path(engine_path).is_file() or os.name != "posix":
+    engine = Path(engine_path)
+    if not engine.is_file():
         return {"linked": False, "missing": False}
-    try:
-        result = subprocess.run(["ldd", str(engine_path)], capture_output=True, text=True,
-                                timeout=3, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return {"linked": False, "missing": False}
-    lines = [line for line in result.stdout.splitlines() if "libcudart" in line]
-    return {"linked": any("not found" not in line for line in lines),
-            "missing": any("not found" in line for line in lines)}
+    if os.name == "posix":
+        try:
+            result = subprocess.run(["ldd", str(engine)], capture_output=True, text=True,
+                                    timeout=3, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return {"linked": False, "missing": False}
+        lines = [line for line in result.stdout.splitlines() if "libcudart" in line]
+        return {"linked": any("not found" not in line for line in lines),
+                "missing": any("not found" in line for line in lines)}
+    if sys.platform == "win32":
+        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
+        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
+        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
+        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
+        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        try:
+            built = b"[CUDA] mode: routed experts" in engine.read_bytes()
+        except OSError:
+            return {"linked": False, "missing": False}
+        if not built:
+            return {"linked": False, "missing": False}
+        dll_present = (engine.parent / "coli_cuda.dll").is_file()
+        return {"linked": dll_present, "missing": not dll_present}
+    return {"linked": False, "missing": False}
 
 
 def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
@@ -47,7 +65,7 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
 
     config = model / "config.json"
     try:
-        valid_config = isinstance(json.loads(config.read_text()), dict)
+        valid_config = isinstance(json.loads(config.read_text(encoding="utf-8")), dict)
     except (OSError, ValueError):
         valid_config = False
     checks.append(_check("model.config", "pass" if valid_config else "fail",
@@ -63,7 +81,16 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("storage.persistence", "skip", "persistence requires a model directory"))
 
     engine = Path(engine_path)
-    if engine.is_file() and os.access(engine, os.X_OK):
+    # On Windows, os.access(X_OK) always returns True for any existing file
+    # (NTFS has no execute bit; executability is governed by file extension).
+    # So a chmod(0o644) "non-executable" scenario can't be detected via X_OK
+    # on Windows. Use a platform-aware check: on POSIX, honor the mode bits;
+    # on Windows, any existing file is treated as executable. (#141)
+    if sys.platform == "win32":
+        engine_ok = engine.is_file()
+    else:
+        engine_ok = engine.is_file() and os.access(engine, os.X_OK)
+    if engine_ok:
         checks.append(_check("engine.binary", "pass", "engine executable is ready", path=str(engine)))
     elif engine.is_file():
         checks.append(_check("engine.binary", "fail", "engine exists but is not executable", path=str(engine)))

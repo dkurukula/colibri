@@ -14,7 +14,8 @@
 # window's real measured tok/s through the exact same repin_pass() a chat
 # turn would use, and count how many windows actually paid a disk-read swap
 # — comparing REPIN_EPS=0 (legacy, unconditional) against REPIN_EPS=0.15
-# (load-aware, the project's default) on the IDENTICAL token sequence.
+# (load-aware; the engine's own default for this knob once REPIN is turned on,
+# e.g. via `--policy balanced`) on the IDENTICAL token sequence.
 #
 # Usage (from c/ or anywhere):
 #   scripts/bench_repin.sh
@@ -25,7 +26,7 @@
 #   pip install torch transformers safetensors
 #
 # Tunables (env):
-#   ARCH=native      CPU tier to build (see bench_cpu_tiers.sh for the list)
+#   ARCH=native      CPU tier to build (see docs/tuning.md for the list)
 #   WINDOW=20        tokens per re-pin check window (REPIN_BENCH=$WINDOW)
 #   REPIN_N=15       min tokens between checks (REPIN=$REPIN_N); must be
 #                    <= WINDOW so every window is actually eligible to check
@@ -93,7 +94,7 @@ PIN_STATS="glm_bench_medium/pin_repin_bench.stats"
 if [ ! -f "$PIN_STATS" ]; then
     log "[fixtures] generating expert-usage stats (real pass, for PIN)..."
     REF="$CODE/glm_bench_medium/ref_glm.json" STATS="$CODE/$PIN_STATS" \
-        SNAP=glm_bench_medium ./glm 32 8 8 >/tmp/bench_repin_stats.log 2>&1 || {
+        SNAP=glm_bench_medium ./colibri 32 8 8 >/tmp/bench_repin_stats.log 2>&1 || {
         tail -30 /tmp/bench_repin_stats.log >&2
         exit 1
     }
@@ -103,7 +104,7 @@ fi
 trial(){
     local eps="$1"
     REF="$CODE/$LONG_REF" REPLAY=1 REPIN_BENCH="$WINDOW" REPIN="$REPIN_N" REPIN_EPS="$eps" \
-        PIN="$CODE/$PIN_STATS" PIN_GB="$PIN_GB" SNAP=glm_bench_medium ./glm 32 8 8 2>&1 \
+        PIN="$CODE/$PIN_STATS" PIN_GB="$PIN_GB" SNAP=glm_bench_medium ./colibri 32 8 8 2>&1 \
         | grep -oE '^REPIN bench: [0-9]+/[0-9]+ windows swapped' | grep -oE '[0-9]+/[0-9]+' || true
 }
 median_swaps(){
