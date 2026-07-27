@@ -1,0 +1,26 @@
+[Unit]
+Description=colibri GLM-5.2 OpenAI-compatible server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/colibri/c
+Environment=COLI_API_KEY=REPLACE_WITH_A_GENERATED_KEY
+# Auto-growing the expert cache mid-run makes memory footprint unpredictable;
+# pin it via --ram/--cap instead and size MemoryHigh/MemoryMax to match.
+Environment=CAP_RAISE=0
+ExecStart=/path/to/colibri/c/coli serve --model /path/to/model --host 0.0.0.0 --port 8000 --ram 32 --cap 8
+Restart=on-failure
+RestartSec=15
+# Cap the cgroup below your host's danger zone, not just below --ram. A host
+# running other memory-hungry services (VMs, containers) can be pushed into
+# swap thrashing if colibri's own footprint isn't bounded independently of
+# its own --ram budget — MemoryHigh triggers reclaim, MemoryMax OOM-kills
+# just this unit (which then auto-restarts) instead of the whole host.
+MemoryHigh=36G
+MemoryMax=40G
+StandardOutput=append:/path/to/colibri/serve.log
+StandardError=append:/path/to/colibri/serve.log
+
+[Install]
+WantedBy=default.target
