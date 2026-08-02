@@ -128,6 +128,19 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
         return (int64_t)t->O*(((int64_t)t->I+255)/256)*98 + 4;
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
+/* Kept ungated (no #ifdef COLI_CUDA) even though its only caller is the
+ * CUDA_MISS_GPU ring further down: a device tensor slot is allocated ONCE at a
+ * given fmt/I/O and coli_cuda_tensor_update() never reallocates it (see its
+ * header comment), so pushing a differently-shaped expert into a ring slot
+ * would either corrupt the device buffer or silently read garbage. Every
+ * routed expert shares one fmt/I/O across the whole model in practice (see
+ * repin.h), so this should always be true — but "should always be true" is
+ * exactly the kind of assumption GPU memory safety shouldn't rest on
+ * unverified, hence a real per-call guard rather than trusting the invariant.
+ * Testable without CUDA/a GPU: tests/test_qt_shape_eq.c. */
+static int qt_shape_eq(const QT *a, const QT *b){
+    return a->fmt==b->fmt && a->I==b->I && a->O==b->O;
+}
 
 typedef struct {
     float *in_ln, *post_ln;
@@ -313,6 +326,99 @@ static int qt_cuda_update(QT *t){
                         t->fmt==1?(const void*)t->q8:(const void*)t->q4;
     return coli_cuda_tensor_update(t->cuda,weights,t->s);
 }
+
+/* CUDA_MISS_GPU (opt-in, default 0): decode-time GPU compute for cache-miss
+ * (non-resident, streamed-from-disk) routed experts.
+ *
+ * Measured on an R720 + GTX 1050 Ti (4.2 GB VRAM, PCIe Gen3 x8, ~6.5-7 GB/s
+ * sustained): decode-time CPU expert matmul costs ~8.71s/token on this box,
+ * almost all of it cache misses (~0.6% VRAM hit rate at this card's expert
+ * budget). A decode step's full miss transfer volume is small enough
+ * (~12.7 GB at ~18.9 MB/expert) that PCIe upload of the miss set is cheaper
+ * than CPU compute of it, IF the miss experts run through the same fused
+ * coli_cuda_expert_mlp() kernel already used for resident experts (see the
+ * call site a few hundred lines below, and coli_cuda_expert_mlp's own doc
+ * comment in backend_cuda.h) instead of the CPU expert_gate_up/matmul_qt path.
+ *
+ * This does NOT try to keep the miss set resident (that's what pinning /
+ * CUDA_EXPERT_GB / adaptive re-pin are for) — it reuses a small FIXED ring of
+ * transient device slots, refreshed every call via qt_cuda_update() exactly
+ * like repin_do_swaps() refreshes a VRAM pin slot during adaptive re-pinning
+ * (see that function, a few thousand lines below, for the closest existing
+ * precedent to this one). One miss expert occupies the ring slot only for the
+ * duration of its own coli_cuda_expert_mlp() call.
+ *
+ * Ring slots are allocated ONCE, lazily, on the very first decode-time miss
+ * seen with CUDA_MISS_GPU set — not literally "at CUDA init time", because no
+ * expert has been streamed from disk yet that early. This is the same
+ * "first successful call uploads, later calls reuse it" idiom
+ * coli_cuda_matmul's own header comment documents for the general matmul path;
+ * qt_shape_eq() (above, kept CUDA-independent so it's unit-testable without a
+ * GPU) then guards every later refresh against the byte-uniform-experts
+ * assumption ever being false for some model this hasn't been tried on,
+ * instead of trusting it silently.
+ *
+ * S==1 (decode) only. Prefill's batched CPU path is already well parallelized
+ * across OpenMP threads and is out of scope here — S>1 never reaches this
+ * code (see the call site's `S==1` guard). Single GPU (g_cuda_devices[0])
+ * only: sharding the miss ring itself across multiple devices is unneeded
+ * complexity for the single-GPU box this was built and measured on, and is
+ * left for a follow-up if it's ever needed.
+ *
+ * Any failure (ring init, upload, compute) falls back to the CPU path one
+ * layer up — this must never turn a cache miss into a hard failure. */
+static int g_cuda_miss_gpu;
+#define COLI_MISS_RING_N 2
+static QT g_miss_ring_g[COLI_MISS_RING_N], g_miss_ring_u[COLI_MISS_RING_N], g_miss_ring_d[COLI_MISS_RING_N];
+static int g_miss_ring_state;   /* 0=untried, 1=ready, -1=failed (e.g. fmt 5/6 has no CUDA kernel) */
+static int g_miss_ring_rr;
+static uint64_t g_miss_gpu_hits, g_miss_gpu_fallback, g_miss_gpu_shape_mismatch;
+
+static int miss_ring_init(const ESlot *e, int device){
+    for(int i=0;i<COLI_MISS_RING_N;i++){
+        QT *rg=&g_miss_ring_g[i], *ru=&g_miss_ring_u[i], *rd=&g_miss_ring_d[i];
+        *rg=e->g; rg->cuda=NULL; rg->cuda_device=device;
+        *ru=e->u; ru->cuda=NULL; ru->cuda_device=device;
+        *rd=e->d; rd->cuda=NULL; rd->cuda_device=device;
+        if(!qt_cuda_upload(rg) || !qt_cuda_upload(ru) || !qt_cuda_upload(rd)){
+            for(int k=0;k<=i;k++){
+                qt_cuda_reset(&g_miss_ring_g[k]); qt_cuda_reset(&g_miss_ring_u[k]); qt_cuda_reset(&g_miss_ring_d[k]);
+            }
+            return 0;
+        }
+    }
+    return 1;
+}
+/* Compute one decode-time cache-miss expert's fused MLP on the GPU. e's host
+ * copy must already be loaded (caller ensures via expert_host_ensure, same as
+ * the CPU path). y[O] receives the result on success; x_row[I] is the single
+ * decode row. Returns 0 on any failure — caller must fall back to the CPU
+ * path, unchanged, exactly as if this function had never been called. */
+static int coli_miss_gpu_try(const ESlot *e, float *y, const float *x_row, int device){
+    if(g_miss_ring_state==0) g_miss_ring_state = miss_ring_init(e,device) ? 1 : -1;
+    if(g_miss_ring_state<0) return 0;
+    if(!qt_shape_eq(&e->g,&g_miss_ring_g[0]) || !qt_shape_eq(&e->u,&g_miss_ring_u[0]) ||
+       !qt_shape_eq(&e->d,&g_miss_ring_d[0])){
+        g_miss_gpu_shape_mismatch++;
+        return 0;
+    }
+    int i = g_miss_ring_rr++ % COLI_MISS_RING_N;
+    QT *rg=&g_miss_ring_g[i], *ru=&g_miss_ring_u[i], *rd=&g_miss_ring_d[i];
+    rg->qf=e->g.qf; rg->q8=e->g.q8; rg->q4=e->g.q4; rg->s=e->g.s;
+    ru->qf=e->u.qf; ru->q8=e->u.q8; ru->q4=e->u.q4; ru->s=e->u.s;
+    rd->qf=e->d.qf; rd->q8=e->d.q8; rd->q4=e->d.q4; rd->s=e->d.s;
+    if(!qt_cuda_update(rg) || !qt_cuda_update(ru) || !qt_cuda_update(rd)){
+        g_miss_gpu_fallback++;
+        return 0;
+    }
+    if(!coli_cuda_expert_mlp(rg->cuda,ru->cuda,rd->cuda,y,x_row,1)){
+        g_miss_gpu_fallback++;
+        return 0;
+    }
+    g_miss_gpu_hits++;
+    return 1;
+}
+
 static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-window split (OVL report) */
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
@@ -3508,6 +3614,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 double dt=now_s()-t0;m->t_emm+=dt;if(g_prof)m->t_egpu+=dt;continue;
             }
             if(!e->slab) expert_host_ensure(m,layer,e);
+            /* CUDA_MISS_GPU: this expert missed the resident/pin tier above (not
+             * cuda_eligible) and is being streamed from disk — try the GPU ring
+             * instead of the CPU path below. S==1 (decode) only; nr==1 is implied
+             * (the nr==0 case already `continue`d earlier in this loop). */
+            if(g_cuda_miss_gpu && g_cuda_enabled && S==1 && !omp_in_parallel() &&
+               coli_miss_gpu_try(e,hh,xg,g_cuda_devices[0])){
+                float *os=out+(int64_t)rows[0]*D, wgt=rw[0], *hr=hh;
+                for(int d=0;d<D;d++) os[d]+=wgt*hr[d];
+                double dt=now_s()-t0; m->t_emm+=dt; if(g_prof) m->t_egpu+=dt;
+                continue;
+            }
 #endif
             expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
@@ -5141,6 +5258,10 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 #ifdef COLI_CUDA
     if(m->gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
+    if(g_cuda_miss_gpu) printf("CUDA_MISS_GPU: %llu decode misses served from GPU, %llu CPU fallback"
+        " (%llu shape mismatch)\n",
+        (unsigned long long)g_miss_gpu_hits,(unsigned long long)g_miss_gpu_fallback,
+        (unsigned long long)g_miss_gpu_shape_mismatch);
     if(g_cuda_enabled) cuda_stats_print();
 #endif
 }
@@ -6915,16 +7036,20 @@ int main(int argc, char **argv){
     if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
        !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
+    g_cuda_miss_gpu=getenv("CUDA_MISS_GPU")?atoi(getenv("CUDA_MISS_GPU")):0;
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if((g_cuda_expert_gb>0||g_cuda_expert_auto) && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
-    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s\n",
+    if(g_cuda_miss_gpu&&!g_cuda_enabled){ fprintf(stderr,"CUDA_MISS_GPU requires COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s%s\n",
         g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
-        g_cuda_release_host?"; VRAM experts without host backing":"");
+        g_cuda_release_host?"; VRAM experts without host backing":"",
+        g_cuda_miss_gpu?"; decode-time cache-miss experts on GPU (CUDA_MISS_GPU)":"");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
        (getenv("CUDA_DENSE") && atoi(getenv("CUDA_DENSE"))) ||
+       (getenv("CUDA_MISS_GPU") && atoi(getenv("CUDA_MISS_GPU"))) ||
         (getenv("CUDA_EXPERT_GB") &&
         (!strcmp(getenv("CUDA_EXPERT_GB"),"auto")||atof(getenv("CUDA_EXPERT_GB"))>0))){
         fprintf(stderr,"CUDA was requested, but this binary is CPU-only; rebuild with: make CUDA=1\n");
