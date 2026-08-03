@@ -506,7 +506,27 @@ class DispatcherTest(unittest.TestCase):
             "wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
             "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
+            "gpu_miss_hits": 0, "gpu_miss_fallback": 0,
         }])
+
+    def test_prof_gpu_miss_fields_parsed_when_present(self):
+        # CUDA_MISS_GPU's two trailing fields (11th/12th) on a real PROF line
+        # from a build with the feature on -- verifies they're actually read,
+        # not just defaulted, and that an older 10-field line still defaults
+        # to 0 rather than raising (covered by the test above).
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15 640 3\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 12 4.8 0 1.0 7 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(list(engine.profile)[0]["gpu_miss_hits"], 640)
+        self.assertEqual(list(engine.profile)[0]["gpu_miss_fallback"], 3)
 
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None

@@ -549,6 +549,10 @@ typedef struct {
     uint64_t hit_pin,hit_ecache;
     uint64_t dc_n[2], dc_direct_n[2]; int64_t dc_bytes[2], dc_ns[2]; /* DISK-CLASS */
     int64_t dc_wall_ns[2], dc_wall_all_ns;       /* busy-wall (per class + combined) */
+    /* CUDA_MISS_GPU per-request counters. Always present (not #ifdef COLI_CUDA)
+     * so mux_done()'s single PROF printf doesn't need a conditional format
+     * string; on a CPU-only build these just stay 0 (see prof_base() below). */
+    uint64_t miss_gpu_hits, miss_gpu_fallback;
 } ProfBase;
 static void prof_base(Model *m, ProfBase *b){
     b->edisk=edisk_s(); b->ewait=m->t_ewait; b->emm=m->t_emm;
@@ -566,6 +570,11 @@ static void prof_base(Model *m, ProfBase *b){
         b->dc_direct_n[i]=atomic_load_explicit(&g_dc_direct_n[i],memory_order_relaxed);
     }
     dc_wall_read(b->dc_wall_ns,&b->dc_wall_all_ns);
+#ifdef COLI_CUDA
+    b->miss_gpu_hits=g_miss_gpu_hits; b->miss_gpu_fallback=g_miss_gpu_fallback;
+#else
+    b->miss_gpu_hits=0; b->miss_gpu_fallback=0;
+#endif
 }
 
 static float *falloc(int64_t n){
@@ -5698,17 +5707,30 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     emap_emit(m);
     hits_emit(m);
     /* PROF: per-turn phase timings for the dashboard profiling page —
-     * "PROF <wall_s> <prompt> <completion> <edisk> <ewait> <emm> <attn> <head> <n_fw>".
+     * "PROF <wall_s> <prompt> <completion> <edisk> <ewait> <emm> <attn> <head> <n_fw> <gpu_miss_hits> <gpu_miss_fallback>".
      * edisk = disk service (expert_load wall on the reading threads, overlaps
      * compute); ewait = the stall the compute thread felt — only ewait belongs
      * in a wall-time breakdown. With KV_SLOTS>1 concurrent slots share the
      * batched forwards, so the shares describe the whole engine over the
-     * window, not the single request (same convention as the STAT hit% below). */
-    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",dt,
+     * window, not the single request (same convention as the STAT hit% below).
+     * gpu_miss_hits/fallback: this request's own delta of the CUDA_MISS_GPU
+     * ring's hit/fallback counters (always 0 on a CPU-only build or when
+     * CUDA_MISS_GPU is off) — a direct per-request signal that the decode-time
+     * cache-miss GPU path is actually engaging, not just inferred from the
+     * expert-matmul time bucket moving. Trailing fields, so this stays
+     * backward-compatible with any reader still doing `len(fields) >= 10`. */
+#ifdef COLI_CUDA
+    uint64_t d_gpu_hits=g_miss_gpu_hits-r->pb.miss_gpu_hits;
+    uint64_t d_gpu_fallback=g_miss_gpu_fallback-r->pb.miss_gpu_fallback;
+#else
+    uint64_t d_gpu_hits=0, d_gpu_fallback=0;
+#endif
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu %llu %llu\n",dt,
            r->prompt_tokens,r->emitted,
            edisk_s()-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
            m->t_attn-r->pb.attn,m->t_head-r->pb.head,
-           (unsigned long long)(m->n_fw-r->pb.n_fw));
+           (unsigned long long)(m->n_fw-r->pb.n_fw),
+           (unsigned long long)d_gpu_hits,(unsigned long long)d_gpu_fallback);
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);

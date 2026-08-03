@@ -1178,7 +1178,10 @@ class Engine:
                     self.hits = fields[3]
                     self.hits_seq += 1
                 elif kind == "PROF" and len(fields) >= 10:
-                    # per-turn phase timings: where the engine spent this turn's wall time
+                    # per-turn phase timings: where the engine spent this turn's wall time.
+                    # gpu_miss_hits/fallback (fields 10/11) are trailing and optional -- an
+                    # older engine binary built before CUDA_MISS_GPU's telemetry only sends
+                    # 10 fields, so these default to 0 rather than requiring len(fields) >= 12.
                     self.profile.append({
                         "wall_s": float(fields[1]),
                         "prompt_tokens": int(fields[2]),
@@ -1189,6 +1192,8 @@ class Engine:
                         "attention_s": float(fields[7]),
                         "lm_head_s": float(fields[8]),
                         "forwards": int(fields[9]),
+                        "gpu_miss_hits": int(fields[10]) if len(fields) >= 11 else 0,
+                        "gpu_miss_fallback": int(fields[11]) if len(fields) >= 12 else 0,
                     })
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
