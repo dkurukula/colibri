@@ -1378,7 +1378,14 @@ class APIHandler(BaseHTTPRequestHandler):
     def _check_host(self):
         """DNS-rebinding guard: a web page can resolve a hostname to 127.0.0.1 and
         drive this local server unless we pin the Host header to loopback / the bind
-        address. Rejects requests whose Host is anything else. (#SEC-7)"""
+        address. Rejects requests whose Host is anything else. (#SEC-7)
+
+        The bind address alone isn't enough when listening on 0.0.0.0: the literal
+        string "0.0.0.0" is never a Host header any client sends, so a multi-interface
+        deployment (e.g. reachable on both a LAN IP and a tailnet address) has no
+        address to allowlist automatically. COLI_ALLOWED_HOSTS opts a deployment into
+        naming its other reachable hostnames/IPs explicitly -- empty by default, so
+        single-interface deployments are unaffected."""
         host = self.headers.get("Host", "")
         if host.startswith("["):
             name = host[1:].split("]", 1)[0]                       # [ipv6]:port
@@ -1392,6 +1399,9 @@ class APIHandler(BaseHTTPRequestHandler):
             allowed.add(str(self.server.server_address[0]).strip("[]").lower())
         except Exception:
             pass
+        extra = os.environ.get("COLI_ALLOWED_HOSTS", "")
+        if extra:
+            allowed.update(h.strip().lower() for h in extra.split(",") if h.strip())
         if name not in allowed:
             raise APIError(403, "Host header not allowed.", None, "forbidden")
 

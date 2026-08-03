@@ -1,6 +1,8 @@
+import http.client
 import io
 import json
 import math
+import os
 import socket
 import tempfile
 import threading
@@ -740,6 +742,54 @@ class HTTPTest(unittest.TestCase):
                 "stream": True, "stream_options": "usage",
             })
         self.assertEqual(caught.exception.code, 400)
+
+
+class HostCheckTest(unittest.TestCase):
+    # Bound to 127.0.0.2 (not 127.0.0.1) so "the bind address is allowed" and
+    # "loopback is always allowed" are genuinely two separate code paths --
+    # otherwise both would trivially pass off the same hardcoded LOOPBACK_HOSTS
+    # entry and the bind-address branch would never actually be exercised.
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = FakeEngine()
+        cls.server = APIServer(("127.0.0.2", 0), cls.engine, "test-model", "secret", 16, kv_slots=1)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.scheduler.close()
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def _status(self, host_header):
+        conn = http.client.HTTPConnection("127.0.0.2", self.server.server_port, timeout=2)
+        try:
+            conn.request("GET", "/v1/models", headers={"Authorization": "Bearer secret", "Host": host_header})
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def test_bind_address_is_allowed(self):
+        self.assertEqual(self._status(f"127.0.0.2:{self.server.server_port}"), 200)
+
+    def test_loopback_always_allowed_even_off_bind_address(self):
+        for host in ("127.0.0.1", "localhost", "[::1]"):
+            self.assertEqual(self._status(host), 200, host)
+
+    def test_other_host_rejected_by_default(self):
+        self.assertEqual(self._status("evil.example.com"), 403)
+
+    def test_coli_allowed_hosts_extends_allowlist(self):
+        with patch.dict(os.environ, {"COLI_ALLOWED_HOSTS": "r720.tailc7f4a.ts.net"}):
+            self.assertEqual(self._status("r720.tailc7f4a.ts.net"), 200)
+        # gate stays closed again once the env var reverts to its default-off state
+        self.assertEqual(self._status("r720.tailc7f4a.ts.net"), 403)
+
+    def test_case_insensitive_and_ignores_blanks(self):
+        with patch.dict(os.environ, {"COLI_ALLOWED_HOSTS": " , R720.TailC7f4a.TS.net ,, "}):
+            self.assertEqual(self._status("r720.tailc7f4a.ts.net"), 200)
 
 
 class StaticServingTest(unittest.TestCase):
