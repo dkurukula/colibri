@@ -327,8 +327,8 @@ static int qt_cuda_update(QT *t){
     return coli_cuda_tensor_update(t->cuda,weights,t->s);
 }
 
-/* CUDA_MISS_GPU (opt-in, default 0): decode-time GPU compute for cache-miss
- * (non-resident, streamed-from-disk) routed experts.
+/* CUDA_MISS_GPU (opt-in, default 0): GPU compute for cache-miss (non-resident,
+ * streamed-from-disk or host-ecache-warm) routed experts, decode and prefill.
  *
  * Measured on an R720 + GTX 1050 Ti (4.2 GB VRAM, PCIe Gen3 x8, ~6.5-7 GB/s
  * sustained): decode-time CPU expert matmul costs ~8.71s/token on this box,
@@ -358,12 +358,27 @@ static int qt_cuda_update(QT *t){
  * assumption ever being false for some model this hasn't been tried on,
  * instead of trusting it silently.
  *
- * S==1 (decode) only. Prefill's batched CPU path is already well parallelized
- * across OpenMP threads and is out of scope here — S>1 never reaches this
- * code (see the call site's `S==1` guard). Single GPU (g_cuda_devices[0])
- * only: sharding the miss ring itself across multiple devices is unneeded
- * complexity for the single-GPU box this was built and measured on, and is
- * left for a follow-up if it's ever needed.
+ * Also covers prefill (S>1): a miss expert's rows are already gathered into
+ * a contiguous [nr,I] buffer by the caller (same xg/hh scratch the resident
+ * coli_cuda_expert_mlp call above uses), and coli_cuda_expert_mlp batches
+ * arbitrary row counts natively (its device-side x/y/gate/up buffers grow
+ * via reserve(), no fixed cap) — so nr>1 was already supported by the
+ * kernel underneath; only this wrapper and its S==1 call-site guard were
+ * artificially restricting it to one row. That restriction was a real
+ * production bottleneck, not a conservative default: measured live on a
+ * 10,819-token cold-cache prefill (no COLI_CUDA_PIPE, so the resident-tier
+ * expert-group path — group_enabled = S<=64 || (g_cuda_pipe && S<=4096) —
+ * never engages either), the VRAM-resident tier covers only a handful of
+ * experts at this card's ~2.16 GB budget, so nearly the full 256-expert/layer
+ * routing diversity a long prompt touches fell through to the CPU miss path:
+ * 30 CPU cores pegged, disk reads near-idle (already warm), ~14 min/layer.
+ * Batching the miss set through this same ring instead amortizes each
+ * expert's one-time PCIe weight upload over however many prefill rows chose
+ * it, which is strictly cheaper per row than the decode case this was
+ * designed for. Single GPU (g_cuda_devices[0]) only: sharding the miss ring
+ * itself across multiple devices is unneeded complexity for the single-GPU
+ * box this was built and measured on, and is left for a follow-up if it's
+ * ever needed.
  *
  * Any failure (ring init, upload, compute) falls back to the CPU path one
  * layer up — this must never turn a cache miss into a hard failure. */
@@ -389,12 +404,14 @@ static int miss_ring_init(const ESlot *e, int device){
     }
     return 1;
 }
-/* Compute one decode-time cache-miss expert's fused MLP on the GPU. e's host
- * copy must already be loaded (caller ensures via expert_host_ensure, same as
- * the CPU path). y[O] receives the result on success; x_row[I] is the single
- * decode row. Returns 0 on any failure — caller must fall back to the CPU
- * path, unchanged, exactly as if this function had never been called. */
-static int coli_miss_gpu_try(const ESlot *e, float *y, const float *x_row, int device){
+/* Compute one cache-miss expert's fused MLP on the GPU, for nr rows at once
+ * (nr==1 for a decode-time miss, nr>1 for a prefill miss batching every
+ * prompt position that routed to this expert). e's host copy must already be
+ * loaded (caller ensures via expert_host_ensure, same as the CPU path). xg
+ * is [nr,I] contiguous (the caller's existing gather scratch), y is [nr,O].
+ * Returns 0 on any failure — caller must fall back to the CPU path,
+ * unchanged, exactly as if this function had never been called. */
+static int coli_miss_gpu_try(const ESlot *e, float *y, const float *xg, int nr, int device){
     if(g_miss_ring_state==0) g_miss_ring_state = miss_ring_init(e,device) ? 1 : -1;
     if(g_miss_ring_state<0) return 0;
     if(!qt_shape_eq(&e->g,&g_miss_ring_g[0]) || !qt_shape_eq(&e->u,&g_miss_ring_u[0]) ||
@@ -411,7 +428,7 @@ static int coli_miss_gpu_try(const ESlot *e, float *y, const float *x_row, int d
         g_miss_gpu_fallback++;
         return 0;
     }
-    if(!coli_cuda_expert_mlp(rg->cuda,ru->cuda,rd->cuda,y,x_row,1)){
+    if(!coli_cuda_expert_mlp(rg->cuda,ru->cuda,rd->cuda,y,xg,nr)){
         g_miss_gpu_fallback++;
         return 0;
     }
@@ -3624,13 +3641,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             if(!e->slab) expert_host_ensure(m,layer,e);
             /* CUDA_MISS_GPU: this expert missed the resident/pin tier above (not
-             * cuda_eligible) and is being streamed from disk — try the GPU ring
-             * instead of the CPU path below. S==1 (decode) only; nr==1 is implied
-             * (the nr==0 case already `continue`d earlier in this loop). */
-            if(g_cuda_miss_gpu && g_cuda_enabled && S==1 && !omp_in_parallel() &&
-               coli_miss_gpu_try(e,hh,xg,g_cuda_devices[0])){
-                float *os=out+(int64_t)rows[0]*D, wgt=rw[0], *hr=hh;
-                for(int d=0;d<D;d++) os[d]+=wgt*hr[d];
+             * cuda_eligible) and is being streamed from disk (or warm in the
+             * host ecache) — try the GPU ring instead of the CPU path below.
+             * xg already holds this expert's nr gathered rows (built above,
+             * same buffer the resident-tier call a few lines up uses) — S==1
+             * decode is just the nr==1 case of the same call. */
+            if(g_cuda_miss_gpu && g_cuda_enabled && !omp_in_parallel() &&
+               coli_miss_gpu_try(e,hh,xg,nr,g_cuda_devices[0])){
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 double dt=now_s()-t0; m->t_emm+=dt; if(g_prof) m->t_egpu+=dt;
                 continue;
             }
@@ -5267,7 +5286,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 #ifdef COLI_CUDA
     if(m->gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
-    if(g_cuda_miss_gpu) printf("CUDA_MISS_GPU: %llu decode misses served from GPU, %llu CPU fallback"
+    if(g_cuda_miss_gpu) printf("CUDA_MISS_GPU: %llu misses served from GPU, %llu CPU fallback"
         " (%llu shape mismatch)\n",
         (unsigned long long)g_miss_gpu_hits,(unsigned long long)g_miss_gpu_fallback,
         (unsigned long long)g_miss_gpu_shape_mismatch);
@@ -5715,7 +5734,7 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
      * window, not the single request (same convention as the STAT hit% below).
      * gpu_miss_hits/fallback: this request's own delta of the CUDA_MISS_GPU
      * ring's hit/fallback counters (always 0 on a CPU-only build or when
-     * CUDA_MISS_GPU is off) — a direct per-request signal that the decode-time
+     * CUDA_MISS_GPU is off) — a direct per-request signal that the
      * cache-miss GPU path is actually engaging, not just inferred from the
      * expert-matmul time bucket moving. Trailing fields, so this stays
      * backward-compatible with any reader still doing `len(fields) >= 10`. */
@@ -7066,7 +7085,7 @@ int main(int argc, char **argv){
     if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s%s\n",
         g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
         g_cuda_release_host?"; VRAM experts without host backing":"",
-        g_cuda_miss_gpu?"; decode-time cache-miss experts on GPU (CUDA_MISS_GPU)":"");
+        g_cuda_miss_gpu?"; cache-miss experts on GPU, decode+prefill (CUDA_MISS_GPU)":"");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
