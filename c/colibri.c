@@ -358,30 +358,29 @@ static int qt_cuda_update(QT *t){
  * assumption ever being false for some model this hasn't been tried on,
  * instead of trusting it silently.
  *
- * Also covers small prefill batches (1<nr<=64): a miss expert's rows are
- * gathered into a contiguous [nr,I] buffer by the caller (same xg/hh scratch
- * the resident coli_cuda_expert_mlp call above uses). The nr<=64 cap (see the
- * call site) mirrors the resident-tier expert-group path's own S<=64 cap, and
- * for the same reason: coli_cuda_expert_mlp's underlying quant_matmul kernel
- * launches an (O,S) block grid where every block independently re-reads and
- * re-dequantizes the same weight row from GMEM, with no reuse across the
- * row/S dimension. Negligible at nr==1 (decode) or nr<=64 (already the
- * resident tier's accepted regime); for a large cold-prefill miss batch (nr
- * in the hundreds — one popular expert shared across many prompt positions)
- * that blowup multiplies GMEM traffic by nr on this card's 6 SMs.
+ * Also covers prefill (nr>1): a miss expert's rows are gathered into a
+ * contiguous [nr,I] buffer by the caller (same xg/hh scratch the resident
+ * coli_cuda_expert_mlp call above uses). nr==1 dispatches to
+ * coli_cuda_expert_mlp (untiled); nr>1 dispatches to coli_cuda_expert_mlp_
+ * tiled (see coli_miss_gpu_try and backend_cuda.cu's quant_matmul_tiled doc
+ * comment) — the tiled kernel shares the dequantized weight row across a
+ * tile of rows in shared memory instead of quant_matmul's one-block-per-
+ * (output,row) re-read, which multiplies GMEM traffic by nr for a large
+ * batch.
  *
- * This was tried uncapped first and measured live on a 10-14k token
- * cold-cache prefill: 22-25 min/layer, WORSE than the 12-18 min/layer
- * pre-existing baseline (rolled back same session) — the VRAM-resident tier
- * covers only a handful of the 256 experts/layer at this card's ~2.16 GB
- * budget, so nearly the full routing diversity a long cold prompt touches
- * lands as misses with nr often in the hundreds, squarely in the kernel's bad
- * regime. Capped at nr<=64 this can only help (small miss batches that
- * previously went straight to CPU now get a shot at GPU) and never regress
- * (nr>64 takes the exact unchanged CPU path, as if this feature didn't
- * exist). A real fix for the large-nr case needs a kernel that tiles/shares
- * the dequantized weight row across S instead of reloading it per row — out
- * of scope here. Single GPU (g_cuda_devices[0]) only: sharding the miss ring
+ * History: an uncapped nr>1 rollout using the UNTILED kernel for every nr was
+ * tried first and measured live on a 10-14k token cold-cache prefill: 22-25
+ * min/layer, WORSE than the 12-18 min/layer pre-existing baseline (rolled
+ * back same session) — the VRAM-resident tier covers only a handful of the
+ * 256 experts/layer at this card's ~2.16 GB budget, so nearly the full
+ * routing diversity a long cold prompt touches lands as misses with nr often
+ * in the hundreds, squarely in the untiled kernel's bad regime. A same-day
+ * follow-up capped nr<=64 as a strictly-safe stopgap (large nr behaves as if
+ * the feature didn't exist). This is the real fix that stopgap deferred:
+ * bench_expert_mlp_tiled.cu measured the tiled kernel 3.4-3.8x faster than
+ * untiled, flat from nr=8 through nr=1024, on this exact card — so the nr<=64
+ * cap is gone; nr>1 now wins in the regime it used to lose in. Single GPU
+ * (g_cuda_devices[0]) only: sharding the miss ring
  * itself across multiple devices is unneeded complexity for the single-GPU
  * box this was built and measured on, and is left for a follow-up if it's
  * ever needed.
@@ -411,13 +410,13 @@ static int miss_ring_init(const ESlot *e, int device){
     return 1;
 }
 /* Compute one cache-miss expert's fused MLP on the GPU, for nr rows at once
- * (nr==1 for a decode-time miss, nr>1 for a small prefill miss batch —
- * capped at nr<=64 by the caller, see the call site and the doc comment
- * above for why). e's host copy must already be loaded (caller ensures via
- * expert_host_ensure, same as the CPU path). xg is [nr,I] contiguous (the
- * caller's existing gather scratch), y is [nr,O]. Returns 0 on any failure
- * — caller must fall back to the CPU path, unchanged, exactly as if this
- * function had never been called. */
+ * (nr==1 for a decode-time miss, nr>1 for a prefill miss batch of any size —
+ * see the dispatch below for why nr>1 no longer needs the nr<=64 cap the
+ * previous commit added). e's host copy must already be loaded (caller
+ * ensures via expert_host_ensure, same as the CPU path). xg is [nr,I]
+ * contiguous (the caller's existing gather scratch), y is [nr,O]. Returns 0
+ * on any failure — caller must fall back to the CPU path, unchanged, exactly
+ * as if this function had never been called. */
 static int coli_miss_gpu_try(const ESlot *e, float *y, const float *xg, int nr, int device){
     if(g_miss_ring_state==0) g_miss_ring_state = miss_ring_init(e,device) ? 1 : -1;
     if(g_miss_ring_state<0) return 0;
@@ -435,7 +434,15 @@ static int coli_miss_gpu_try(const ESlot *e, float *y, const float *xg, int nr, 
         g_miss_gpu_fallback++;
         return 0;
     }
-    if(!coli_cuda_expert_mlp(rg->cuda,ru->cuda,rd->cuda,y,xg,nr)){
+    /* nr==1 (decode): the untiled kernel wins (measured 2.1ms vs 3.1ms at
+     * nr=1 — quant_matmul_tiled's shared-memory load barrier isn't worth it
+     * for a single row). nr>1 (any prefill miss batch): the tiled kernel
+     * wins by 3.4-3.8x, flat from nr=8 through nr=1024 (bench_expert_mlp_
+     * tiled.cu on the real GTX 1050 Ti + real model dims) — no cap needed
+     * anymore, unlike the untiled kernel this replaces for nr>1. */
+    int ok = nr==1 ? coli_cuda_expert_mlp(rg->cuda,ru->cuda,rd->cuda,y,xg,nr)
+                   : coli_cuda_expert_mlp_tiled(rg->cuda,ru->cuda,rd->cuda,y,xg,nr);
+    if(!ok){
         g_miss_gpu_fallback++;
         return 0;
     }
@@ -3654,26 +3661,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * same buffer the resident-tier call a few lines up uses) — S==1
              * decode is just the nr==1 case of the same call.
              *
-             * nr<=64 mirrors group_enabled's existing S<=64 cap a few hundred
-             * lines up, and for the same underlying reason: quant_matmul's grid
-             * is (O,S) blocks, and every block independently re-reads and
-             * re-dequantizes the SAME weight row from GMEM — no reuse across
-             * the row/batch dimension. Negligible waste at nr==1 or nr<=64
-             * (already the resident tier's own accepted regime), but for a
-             * large cold-prefill miss batch (nr in the hundreds, one expert
-             * shared across many prompt positions) that blowup multiplies
-             * GMEM traffic by nr on a 6-SM card. Measured live on production
-             * (10-14k token cold prefill, uncapped): 22-25 min/layer, WORSE
-             * than the 12-18 min/layer pre-CUDA_MISS_GPU-prefill baseline —
-             * rolled back same session. This cap keeps the decode win (nr
-             * always 1) and helps any prefill miss batch small enough for the
-             * kernel's actual efficient regime, while leaving large misses on
-             * the unchanged, already-proven CPU path — strictly no regression
-             * risk, since >64 behaves exactly as if this whole feature didn't
-             * exist. A real fix for the large-nr case needs a kernel that
-             * tiles/shares the dequantized weight row across S instead of
-             * reloading it per row — out of scope here. */
-            if(g_cuda_miss_gpu && g_cuda_enabled && nr<=64 && !omp_in_parallel() &&
+             * No nr cap: the previous commit capped this at nr<=64 after an
+             * uncapped nr>1 rollout regressed a real cold prefill live (22-25
+             * min/layer vs a 12-18 min/layer baseline) — root cause was
+             * quant_matmul's one-block-per-(output,row) design re-reading the
+             * weight row from GMEM once per row, multiplying traffic by nr on
+             * this card's 6 SMs. coli_miss_gpu_try now dispatches nr>1 to
+             * quant_matmul_tiled instead, which shares the dequantized weight
+             * row across a tile of rows in shared memory — measured 3.4-3.8x
+             * faster than the untiled kernel, flat from nr=8 through nr=1024
+             * (tests/bench_expert_mlp_tiled.cu on this exact card), so the
+             * regime the cap was protecting against is now the regime this
+             * wins in. */
+            if(g_cuda_miss_gpu && g_cuda_enabled && !omp_in_parallel() &&
                coli_miss_gpu_try(e,hh,xg,nr,g_cuda_devices[0])){
                 for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
                     for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -7112,7 +7112,7 @@ int main(int argc, char **argv){
     if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s%s\n",
         g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
         g_cuda_release_host?"; VRAM experts without host backing":"",
-        g_cuda_miss_gpu?"; cache-miss experts on GPU, decode+small prefill batches (CUDA_MISS_GPU)":"");
+        g_cuda_miss_gpu?"; cache-miss experts on GPU, decode+prefill, tiled for nr>1 (CUDA_MISS_GPU)":"");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
