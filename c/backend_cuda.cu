@@ -160,6 +160,65 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         y[(size_t)s * O + o] = (fmt && fmt != 4) ? partial[0] * scales[o] : partial[0];
 }
 
+/* Row-tiled variant of quant_matmul, for the case quant_matmul is bad at: many
+ * rows (S) sharing ONE weight matrix. quant_matmul's grid is (O,S) — every
+ * block owns exactly one (output,row) pair and independently re-reads and
+ * re-dequantizes the same weight row from GMEM. Fine when S is small (decode
+ * S==1, the resident-tier group path's S<=64), but for S in the hundreds
+ * (one popular expert shared across many prefill positions) that multiplies
+ * GMEM weight traffic by S on a card with modest bandwidth — measured live
+ * (see CUDA_MISS_GPU's nr<=64 cap in colibri.c) to make the "GPU path"
+ * slower than 30 CPU cores for a real cold-prefill miss batch.
+ *
+ * w4a16_matmul (above) already solves this via WMMA tensor-core tiles, but
+ * is gated __CUDA_ARCH__>=700 (Volta+) and is a no-op on this box's GTX 1050
+ * Ti (sm_61, Pascal, no tensor cores). This is the same tiling IDEA —
+ * dequantize the weight row into shared memory once per block, reuse it
+ * across QMT_TILE_S rows — done with plain FMA math instead of wmma, so it
+ * actually runs here.
+ *
+ * Grid: (O, ceil(S/QMT_TILE_S)). Block: 32*QMT_TILE_S threads — one warp per
+ * tiled row, warp-shuffle reduction (no shared-memory reduction scratch
+ * needed, unlike quant_matmul's binary-tree reduction). Dynamic shared
+ * memory: I floats (the dequantized, [fmt==4: pre-group-scaled] weight row) —
+ * a few KB for this model's expert dims, far under Pascal's 48KB/block cap.
+ *
+ * Math per row is the identical strided-sum-then-reduce quant_matmul does;
+ * only the reduction topology differs (warp shuffle vs shared-memory tree),
+ * so output matches to float rounding, not bit-for-bit — same accepted-
+ * reassociation category as the AVX score-reduction precedent (#481/#442),
+ * not a numerics change worth gating behind anything beyond the existing
+ * "any CUDA failure falls back to CPU, never silently wrong" contract. */
+#define QMT_TILE_S 8
+__global__ static void quant_matmul_tiled(float *y, const float *x, const void *weights,
+                                          const float *scales, int fmt, int S, int I, int O,
+                                          size_t rb, int gs, int ng) {
+    int o = blockIdx.x;
+    int row_local = threadIdx.x >> 5;         /* 0..QMT_TILE_S-1: this warp's row */
+    int lane = threadIdx.x & 31;
+    int s = blockIdx.y * QMT_TILE_S + row_local;
+    extern __shared__ float wrow[];           /* [I]: dequantized weight row for output o */
+    size_t row = (size_t)o * rb;
+    for (int i = threadIdx.x; i < I; i += blockDim.x)
+        wrow[i] = weight_at(weights, fmt, row, i);
+    __syncthreads();
+    if (s >= S) return;
+    const float *xs = x + (size_t)s * I;
+    float sum = 0.0f;
+    if (fmt == 4) {
+        const float *scl = scales + (size_t)o * ng;
+        for (int i = lane; i < I; i += 32) {
+            int g = i / gs;
+            if (g >= ng) g = ng - 1;
+            sum += xs[i] * wrow[i] * scl[g];
+        }
+    } else {
+        for (int i = lane; i < I; i += 32) sum += xs[i] * wrow[i];
+    }
+    for (int off = 16; off; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
+    if (!lane) y[(size_t)s * O + o] = (fmt && fmt != 4) ? sum * scales[o] : sum;
+}
+
 __global__ static void silu_mul(float *gate, const float *up, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -749,6 +808,48 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
         down->fmt,S,I,D,row_bytes(down->fmt,I),down->gs,down->ng);
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
+        !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
+    return 1;
+}
+
+/* Prototype: coli_cuda_expert_mlp using quant_matmul_tiled instead of
+ * quant_matmul, for the large-S (many prefill rows, one expert) case where
+ * the untiled kernel's per-row weight re-read dominates. NOT wired into any
+ * call site yet -- see tests/bench_expert_mlp_tiled.cu for the correctness +
+ * timing comparison this needs before it's trusted anywhere, let alone
+ * production. Same contract as coli_cuda_expert_mlp otherwise: 0 on any
+ * failure, caller falls back to CPU. */
+extern "C" int coli_cuda_expert_mlp_tiled(ColiCudaTensor *gate, ColiCudaTensor *up,
+                                            ColiCudaTensor *down, float *y,
+                                            const float *x, int S) {
+    if (fault_injected()) return 0;
+    if (gate && ((gate->fmt == 4 && gate->gs <= 0) ||
+                 (up && up->fmt == 4 && up->gs <= 0) ||
+                 (down && down->fmt == 4 && down->gs <= 0))) return 0;
+    if (!gate || !up || !down || !x || !y || S < 1 ||
+        gate->device != up->device || gate->device != down->device ||
+        gate->I != up->I || gate->O != up->O ||
+        down->I != gate->O || down->O != gate->I) return 0;
+    DeviceContext *ctx = find_ctx(gate->device);
+    if (!select_ctx(ctx)) return 0;
+    int D = gate->I, I = gate->O;
+    size_t xb=(size_t)S*D*sizeof(float), ib=(size_t)S*I*sizeof(float);
+    size_t yb=(size_t)S*D*sizeof(float);
+    if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
+        !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
+    if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
+    int stiles = (S + QMT_TILE_S - 1) / QMT_TILE_S;
+    dim3 hidden_grid((unsigned)I,(unsigned)stiles), output_grid((unsigned)D,(unsigned)stiles);
+    size_t hidden_shmem = (size_t)D*sizeof(float), output_shmem = (size_t)I*sizeof(float);
+    quant_matmul_tiled<<<hidden_grid,32*QMT_TILE_S,hidden_shmem>>>(ctx->gate,ctx->x,gate->weights,gate->scales,
+        gate->fmt,S,D,I,row_bytes(gate->fmt,D),gate->gs,gate->ng);
+    quant_matmul_tiled<<<hidden_grid,32*QMT_TILE_S,hidden_shmem>>>(ctx->up,ctx->x,up->weights,up->scales,
+        up->fmt,S,D,I,row_bytes(up->fmt,D),up->gs,up->ng);
+    size_t n=(size_t)S*I;
+    silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
+    quant_matmul_tiled<<<output_grid,32*QMT_TILE_S,output_shmem>>>(ctx->y,ctx->gate,down->weights,down->scales,
+        down->fmt,S,I,D,row_bytes(down->fmt,I),down->gs,down->ng);
+    if (!cuda_ok(cudaGetLastError(),"expert MLP tiled launch") ||
         !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
     return 1;
 }
