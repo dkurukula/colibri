@@ -752,7 +752,16 @@ class HostCheckTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.engine = FakeEngine()
-        cls.server = APIServer(("127.0.0.2", 0), cls.engine, "test-model", "secret", 16, kv_slots=1)
+        try:
+            cls.server = APIServer(("127.0.0.2", 0), cls.engine, "test-model", "secret", 16, kv_slots=1)
+        except OSError as e:
+            # 127.0.0.2 is bindable by default on Linux but not on macOS, whose
+            # loopback interface only auto-aliases 127.0.0.1 (a second address
+            # needs `sudo ifconfig lo0 alias 127.0.0.2 up`, which nothing here
+            # sets up). Skip rather than fail: the point of this address (see
+            # the class comment above) is a second real bind target distinct
+            # from LOOPBACK_HOSTS' hardcoded 127.0.0.1, not this specific IP.
+            raise unittest.SkipTest(f"127.0.0.2 not bindable on this platform: {e}")
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 

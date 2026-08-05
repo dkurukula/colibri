@@ -38,6 +38,8 @@ typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uin
                                          double *h2d_ms, double *kernel_ms, double *d2h_ms);
 typedef int            (*fn_expert_mlp)(ColiCudaTensor *gate, ColiCudaTensor *up,
                                         ColiCudaTensor *down, float *y, const float *x, int S);
+typedef int            (*fn_expert_mlp_tiled)(ColiCudaTensor *gate, ColiCudaTensor *up,
+                                        ColiCudaTensor *down, float *y, const float *x, int S);
 typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                                           ColiCudaTensor *const *downs, const int *rows, int count,
                                           float *y, const float *x);
@@ -108,6 +110,7 @@ static struct {
     fn_stats           stats;
     fn_group_stats     group_stats;
     fn_expert_mlp      expert_mlp;
+    fn_expert_mlp_tiled expert_mlp_tiled;
     fn_expert_group    expert_group;
     fn_expert_group_issue expert_group_issue;
     fn_expert_group_take expert_group_take;
@@ -208,6 +211,7 @@ static int coli_cuda_load(void){
     RESOLVE(stats,          fn_stats)
     RESOLVE(group_stats,    fn_group_stats)
     RESOLVE(expert_mlp,     fn_expert_mlp)
+    RESOLVE(expert_mlp_tiled, fn_expert_mlp_tiled)
     RESOLVE(expert_group,   fn_expert_group)
     RESOLVE(expert_group_issue, fn_expert_group_issue)
     RESOLVE(expert_group_take, fn_expert_group_take)
@@ -301,6 +305,12 @@ int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S){
     if(!g_cuda.available) return 0;
     return g_cuda.expert_mlp(gate, up, down, y, x, S);
+}
+
+int coli_cuda_expert_mlp_tiled(ColiCudaTensor *gate, ColiCudaTensor *up,
+                         ColiCudaTensor *down, float *y, const float *x, int S){
+    if(!g_cuda.available) return 0;
+    return g_cuda.expert_mlp_tiled(gate, up, down, y, x, S);
 }
 
 int coli_cuda_expert_group(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
