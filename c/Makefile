@@ -205,7 +205,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_repin$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_repin$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE) tests/test_qt_shape_eq$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -333,6 +333,19 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
 
+# CUDA_MISS_GPU integration test (tests/test_cuda_miss_gpu.c): unlike the other
+# GPU tests this one #includes the WHOLE of colibri.c (it exercises colibri.c's
+# own static miss_ring_init/coli_miss_gpu_try, not just backend_cuda.h's public
+# API), so nvcc compiles colibri.c's C through its host-C path alongside
+# backend_cuda.cu's C++/CUDA path in one invocation, same as it already does
+# for any mixed .c/.cu build. -DCOLI_CUDA is required (the file only compiles
+# under it). Skips (exit 77) on a machine with the toolchain but no GPU, same
+# as cuda-test.
+miss-gpu-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h colibri.c tests/test_cuda_miss_gpu.c
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_CUDA -Xcompiler -fopenmp backend_cuda.cu tests/test_cuda_miss_gpu.c -o tests/test_cuda_miss_gpu$(EXE)
+	./tests/test_cuda_miss_gpu$(EXE)
+
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
 hip-test:
 	$(MAKE) cuda-test HIP=1
@@ -450,6 +463,9 @@ tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c st.h uring.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_router_nan$(EXE): tests/test_router_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qt_shape_eq$(EXE): tests/test_qt_shape_eq.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c

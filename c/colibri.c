@@ -128,6 +128,19 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
         return (int64_t)t->O*(((int64_t)t->I+255)/256)*98 + 4;
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
+/* Kept ungated (no #ifdef COLI_CUDA) even though its only caller is the
+ * CUDA_MISS_GPU ring further down: a device tensor slot is allocated ONCE at a
+ * given fmt/I/O and coli_cuda_tensor_update() never reallocates it (see its
+ * header comment), so pushing a differently-shaped expert into a ring slot
+ * would either corrupt the device buffer or silently read garbage. Every
+ * routed expert shares one fmt/I/O across the whole model in practice (see
+ * repin.h), so this should always be true — but "should always be true" is
+ * exactly the kind of assumption GPU memory safety shouldn't rest on
+ * unverified, hence a real per-call guard rather than trusting the invariant.
+ * Testable without CUDA/a GPU: tests/test_qt_shape_eq.c. */
+static int qt_shape_eq(const QT *a, const QT *b){
+    return a->fmt==b->fmt && a->I==b->I && a->O==b->O;
+}
 
 typedef struct {
     float *in_ln, *post_ln;
@@ -313,6 +326,130 @@ static int qt_cuda_update(QT *t){
                         t->fmt==1?(const void*)t->q8:(const void*)t->q4;
     return coli_cuda_tensor_update(t->cuda,weights,t->s);
 }
+
+/* CUDA_MISS_GPU (opt-in, default 0): GPU compute for cache-miss (non-resident,
+ * streamed-from-disk or host-ecache-warm) routed experts, decode and prefill.
+ *
+ * Measured on an R720 + GTX 1050 Ti (4.2 GB VRAM, PCIe Gen3 x8, ~6.5-7 GB/s
+ * sustained): decode-time CPU expert matmul costs ~8.71s/token on this box,
+ * almost all of it cache misses (~0.6% VRAM hit rate at this card's expert
+ * budget). A decode step's full miss transfer volume is small enough
+ * (~12.7 GB at ~18.9 MB/expert) that PCIe upload of the miss set is cheaper
+ * than CPU compute of it, IF the miss experts run through the same fused
+ * coli_cuda_expert_mlp() kernel already used for resident experts (see the
+ * call site a few hundred lines below, and coli_cuda_expert_mlp's own doc
+ * comment in backend_cuda.h) instead of the CPU expert_gate_up/matmul_qt path.
+ *
+ * This does NOT try to keep the miss set resident (that's what pinning /
+ * CUDA_EXPERT_GB / adaptive re-pin are for) — it reuses a small FIXED ring of
+ * transient device slots, refreshed every call via qt_cuda_update() exactly
+ * like repin_do_swaps() refreshes a VRAM pin slot during adaptive re-pinning
+ * (see that function, a few thousand lines below, for the closest existing
+ * precedent to this one). One miss expert occupies the ring slot only for the
+ * duration of its own coli_cuda_expert_mlp() call.
+ *
+ * Ring slots are allocated ONCE, lazily, on the very first decode-time miss
+ * seen with CUDA_MISS_GPU set — not literally "at CUDA init time", because no
+ * expert has been streamed from disk yet that early. This is the same
+ * "first successful call uploads, later calls reuse it" idiom
+ * coli_cuda_matmul's own header comment documents for the general matmul path;
+ * qt_shape_eq() (above, kept CUDA-independent so it's unit-testable without a
+ * GPU) then guards every later refresh against the byte-uniform-experts
+ * assumption ever being false for some model this hasn't been tried on,
+ * instead of trusting it silently.
+ *
+ * Also covers prefill (nr>1): a miss expert's rows are gathered into a
+ * contiguous [nr,I] buffer by the caller (same xg/hh scratch the resident
+ * coli_cuda_expert_mlp call above uses). nr==1 dispatches to
+ * coli_cuda_expert_mlp (untiled); nr>1 dispatches to coli_cuda_expert_mlp_
+ * tiled (see coli_miss_gpu_try and backend_cuda.cu's quant_matmul_tiled doc
+ * comment) — the tiled kernel shares the dequantized weight row across a
+ * tile of rows in shared memory instead of quant_matmul's one-block-per-
+ * (output,row) re-read, which multiplies GMEM traffic by nr for a large
+ * batch.
+ *
+ * History: an uncapped nr>1 rollout using the UNTILED kernel for every nr was
+ * tried first and measured live on a 10-14k token cold-cache prefill: 22-25
+ * min/layer, WORSE than the 12-18 min/layer pre-existing baseline (rolled
+ * back same session) — the VRAM-resident tier covers only a handful of the
+ * 256 experts/layer at this card's ~2.16 GB budget, so nearly the full
+ * routing diversity a long cold prompt touches lands as misses with nr often
+ * in the hundreds, squarely in the untiled kernel's bad regime. A same-day
+ * follow-up capped nr<=64 as a strictly-safe stopgap (large nr behaves as if
+ * the feature didn't exist). This is the real fix that stopgap deferred:
+ * bench_expert_mlp_tiled.cu measured the tiled kernel 3.4-3.8x faster than
+ * untiled, flat from nr=8 through nr=1024, on this exact card — so the nr<=64
+ * cap is gone; nr>1 now wins in the regime it used to lose in. Single GPU
+ * (g_cuda_devices[0]) only: sharding the miss ring
+ * itself across multiple devices is unneeded complexity for the single-GPU
+ * box this was built and measured on, and is left for a follow-up if it's
+ * ever needed.
+ *
+ * Any failure (ring init, upload, compute) falls back to the CPU path one
+ * layer up — this must never turn a cache miss into a hard failure. */
+static int g_cuda_miss_gpu;
+#define COLI_MISS_RING_N 2
+static QT g_miss_ring_g[COLI_MISS_RING_N], g_miss_ring_u[COLI_MISS_RING_N], g_miss_ring_d[COLI_MISS_RING_N];
+static int g_miss_ring_state;   /* 0=untried, 1=ready, -1=failed (e.g. fmt 5/6 has no CUDA kernel) */
+static int g_miss_ring_rr;
+static uint64_t g_miss_gpu_hits, g_miss_gpu_fallback, g_miss_gpu_shape_mismatch;
+
+static int miss_ring_init(const ESlot *e, int device){
+    for(int i=0;i<COLI_MISS_RING_N;i++){
+        QT *rg=&g_miss_ring_g[i], *ru=&g_miss_ring_u[i], *rd=&g_miss_ring_d[i];
+        *rg=e->g; rg->cuda=NULL; rg->cuda_device=device;
+        *ru=e->u; ru->cuda=NULL; ru->cuda_device=device;
+        *rd=e->d; rd->cuda=NULL; rd->cuda_device=device;
+        if(!qt_cuda_upload(rg) || !qt_cuda_upload(ru) || !qt_cuda_upload(rd)){
+            for(int k=0;k<=i;k++){
+                qt_cuda_reset(&g_miss_ring_g[k]); qt_cuda_reset(&g_miss_ring_u[k]); qt_cuda_reset(&g_miss_ring_d[k]);
+            }
+            return 0;
+        }
+    }
+    return 1;
+}
+/* Compute one cache-miss expert's fused MLP on the GPU, for nr rows at once
+ * (nr==1 for a decode-time miss, nr>1 for a prefill miss batch of any size —
+ * see the dispatch below for why nr>1 no longer needs the nr<=64 cap the
+ * previous commit added). e's host copy must already be loaded (caller
+ * ensures via expert_host_ensure, same as the CPU path). xg is [nr,I]
+ * contiguous (the caller's existing gather scratch), y is [nr,O]. Returns 0
+ * on any failure — caller must fall back to the CPU path, unchanged, exactly
+ * as if this function had never been called. */
+static int coli_miss_gpu_try(const ESlot *e, float *y, const float *xg, int nr, int device){
+    if(g_miss_ring_state==0) g_miss_ring_state = miss_ring_init(e,device) ? 1 : -1;
+    if(g_miss_ring_state<0) return 0;
+    if(!qt_shape_eq(&e->g,&g_miss_ring_g[0]) || !qt_shape_eq(&e->u,&g_miss_ring_u[0]) ||
+       !qt_shape_eq(&e->d,&g_miss_ring_d[0])){
+        g_miss_gpu_shape_mismatch++;
+        return 0;
+    }
+    int i = g_miss_ring_rr++ % COLI_MISS_RING_N;
+    QT *rg=&g_miss_ring_g[i], *ru=&g_miss_ring_u[i], *rd=&g_miss_ring_d[i];
+    rg->qf=e->g.qf; rg->q8=e->g.q8; rg->q4=e->g.q4; rg->s=e->g.s;
+    ru->qf=e->u.qf; ru->q8=e->u.q8; ru->q4=e->u.q4; ru->s=e->u.s;
+    rd->qf=e->d.qf; rd->q8=e->d.q8; rd->q4=e->d.q4; rd->s=e->d.s;
+    if(!qt_cuda_update(rg) || !qt_cuda_update(ru) || !qt_cuda_update(rd)){
+        g_miss_gpu_fallback++;
+        return 0;
+    }
+    /* nr==1 (decode): the untiled kernel wins (measured 2.1ms vs 3.1ms at
+     * nr=1 — quant_matmul_tiled's shared-memory load barrier isn't worth it
+     * for a single row). nr>1 (any prefill miss batch): the tiled kernel
+     * wins by 3.4-3.8x, flat from nr=8 through nr=1024 (bench_expert_mlp_
+     * tiled.cu on the real GTX 1050 Ti + real model dims) — no cap needed
+     * anymore, unlike the untiled kernel this replaces for nr>1. */
+    int ok = nr==1 ? coli_cuda_expert_mlp(rg->cuda,ru->cuda,rd->cuda,y,xg,nr)
+                   : coli_cuda_expert_mlp_tiled(rg->cuda,ru->cuda,rd->cuda,y,xg,nr);
+    if(!ok){
+        g_miss_gpu_fallback++;
+        return 0;
+    }
+    g_miss_gpu_hits++;
+    return 1;
+}
+
 static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-window split (OVL report) */
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
@@ -443,6 +580,10 @@ typedef struct {
     uint64_t hit_pin,hit_ecache;
     uint64_t dc_n[2], dc_direct_n[2]; int64_t dc_bytes[2], dc_ns[2]; /* DISK-CLASS */
     int64_t dc_wall_ns[2], dc_wall_all_ns;       /* busy-wall (per class + combined) */
+    /* CUDA_MISS_GPU per-request counters. Always present (not #ifdef COLI_CUDA)
+     * so mux_done()'s single PROF printf doesn't need a conditional format
+     * string; on a CPU-only build these just stay 0 (see prof_base() below). */
+    uint64_t miss_gpu_hits, miss_gpu_fallback;
 } ProfBase;
 static void prof_base(Model *m, ProfBase *b){
     b->edisk=edisk_s(); b->ewait=m->t_ewait; b->emm=m->t_emm;
@@ -460,6 +601,11 @@ static void prof_base(Model *m, ProfBase *b){
         b->dc_direct_n[i]=atomic_load_explicit(&g_dc_direct_n[i],memory_order_relaxed);
     }
     dc_wall_read(b->dc_wall_ns,&b->dc_wall_all_ns);
+#ifdef COLI_CUDA
+    b->miss_gpu_hits=g_miss_gpu_hits; b->miss_gpu_fallback=g_miss_gpu_fallback;
+#else
+    b->miss_gpu_hits=0; b->miss_gpu_fallback=0;
+#endif
 }
 
 static float *falloc(int64_t n){
@@ -3508,6 +3654,32 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 double dt=now_s()-t0;m->t_emm+=dt;if(g_prof)m->t_egpu+=dt;continue;
             }
             if(!e->slab) expert_host_ensure(m,layer,e);
+            /* CUDA_MISS_GPU: this expert missed the resident/pin tier above (not
+             * cuda_eligible) and is being streamed from disk (or warm in the
+             * host ecache) — try the GPU ring instead of the CPU path below.
+             * xg already holds this expert's nr gathered rows (built above,
+             * same buffer the resident-tier call a few lines up uses) — S==1
+             * decode is just the nr==1 case of the same call.
+             *
+             * No nr cap: the previous commit capped this at nr<=64 after an
+             * uncapped nr>1 rollout regressed a real cold prefill live (22-25
+             * min/layer vs a 12-18 min/layer baseline) — root cause was
+             * quant_matmul's one-block-per-(output,row) design re-reading the
+             * weight row from GMEM once per row, multiplying traffic by nr on
+             * this card's 6 SMs. coli_miss_gpu_try now dispatches nr>1 to
+             * quant_matmul_tiled instead, which shares the dequantized weight
+             * row across a tile of rows in shared memory — measured 3.4-3.8x
+             * faster than the untiled kernel, flat from nr=8 through nr=1024
+             * (tests/bench_expert_mlp_tiled.cu on this exact card), so the
+             * regime the cap was protecting against is now the regime this
+             * wins in. */
+            if(g_cuda_miss_gpu && g_cuda_enabled && !omp_in_parallel() &&
+               coli_miss_gpu_try(e,hh,xg,nr,g_cuda_devices[0])){
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                double dt=now_s()-t0; m->t_emm+=dt; if(g_prof) m->t_egpu+=dt;
+                continue;
+            }
 #endif
             expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
@@ -5141,6 +5313,10 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 #ifdef COLI_CUDA
     if(m->gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
+    if(g_cuda_miss_gpu) printf("CUDA_MISS_GPU: %llu misses served from GPU, %llu CPU fallback"
+        " (%llu shape mismatch)\n",
+        (unsigned long long)g_miss_gpu_hits,(unsigned long long)g_miss_gpu_fallback,
+        (unsigned long long)g_miss_gpu_shape_mismatch);
     if(g_cuda_enabled) cuda_stats_print();
 #endif
 }
@@ -5577,17 +5753,30 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     emap_emit(m);
     hits_emit(m);
     /* PROF: per-turn phase timings for the dashboard profiling page —
-     * "PROF <wall_s> <prompt> <completion> <edisk> <ewait> <emm> <attn> <head> <n_fw>".
+     * "PROF <wall_s> <prompt> <completion> <edisk> <ewait> <emm> <attn> <head> <n_fw> <gpu_miss_hits> <gpu_miss_fallback>".
      * edisk = disk service (expert_load wall on the reading threads, overlaps
      * compute); ewait = the stall the compute thread felt — only ewait belongs
      * in a wall-time breakdown. With KV_SLOTS>1 concurrent slots share the
      * batched forwards, so the shares describe the whole engine over the
-     * window, not the single request (same convention as the STAT hit% below). */
-    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",dt,
+     * window, not the single request (same convention as the STAT hit% below).
+     * gpu_miss_hits/fallback: this request's own delta of the CUDA_MISS_GPU
+     * ring's hit/fallback counters (always 0 on a CPU-only build or when
+     * CUDA_MISS_GPU is off) — a direct per-request signal that the
+     * cache-miss GPU path is actually engaging, not just inferred from the
+     * expert-matmul time bucket moving. Trailing fields, so this stays
+     * backward-compatible with any reader still doing `len(fields) >= 10`. */
+#ifdef COLI_CUDA
+    uint64_t d_gpu_hits=g_miss_gpu_hits-r->pb.miss_gpu_hits;
+    uint64_t d_gpu_fallback=g_miss_gpu_fallback-r->pb.miss_gpu_fallback;
+#else
+    uint64_t d_gpu_hits=0, d_gpu_fallback=0;
+#endif
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu %llu %llu\n",dt,
            r->prompt_tokens,r->emitted,
            edisk_s()-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
            m->t_attn-r->pb.attn,m->t_head-r->pb.head,
-           (unsigned long long)(m->n_fw-r->pb.n_fw));
+           (unsigned long long)(m->n_fw-r->pb.n_fw),
+           (unsigned long long)d_gpu_hits,(unsigned long long)d_gpu_fallback);
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
@@ -6915,16 +7104,20 @@ int main(int argc, char **argv){
     if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
        !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
+    g_cuda_miss_gpu=getenv("CUDA_MISS_GPU")?atoi(getenv("CUDA_MISS_GPU")):0;
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if((g_cuda_expert_gb>0||g_cuda_expert_auto) && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
-    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s\n",
+    if(g_cuda_miss_gpu&&!g_cuda_enabled){ fprintf(stderr,"CUDA_MISS_GPU requires COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s%s\n",
         g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
-        g_cuda_release_host?"; VRAM experts without host backing":"");
+        g_cuda_release_host?"; VRAM experts without host backing":"",
+        g_cuda_miss_gpu?"; cache-miss experts on GPU, decode+prefill, tiled for nr>1 (CUDA_MISS_GPU)":"");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
        (getenv("CUDA_DENSE") && atoi(getenv("CUDA_DENSE"))) ||
+       (getenv("CUDA_MISS_GPU") && atoi(getenv("CUDA_MISS_GPU"))) ||
         (getenv("CUDA_EXPERT_GB") &&
         (!strcmp(getenv("CUDA_EXPERT_GB"),"auto")||atof(getenv("CUDA_EXPERT_GB"))>0))){
         fprintf(stderr,"CUDA was requested, but this binary is CPU-only; rebuild with: make CUDA=1\n");

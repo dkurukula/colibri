@@ -1,6 +1,8 @@
+import http.client
 import io
 import json
 import math
+import os
 import socket
 import tempfile
 import threading
@@ -506,7 +508,27 @@ class DispatcherTest(unittest.TestCase):
             "wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
             "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
+            "gpu_miss_hits": 0, "gpu_miss_fallback": 0,
         }])
+
+    def test_prof_gpu_miss_fields_parsed_when_present(self):
+        # CUDA_MISS_GPU's two trailing fields (11th/12th) on a real PROF line
+        # from a build with the feature on -- verifies they're actually read,
+        # not just defaulted, and that an older 10-field line still defaults
+        # to 0 rather than raising (covered by the test above).
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15 640 3\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 12 4.8 0 1.0 7 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(list(engine.profile)[0]["gpu_miss_hits"], 640)
+        self.assertEqual(list(engine.profile)[0]["gpu_miss_fallback"], 3)
 
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None
@@ -720,6 +742,63 @@ class HTTPTest(unittest.TestCase):
                 "stream": True, "stream_options": "usage",
             })
         self.assertEqual(caught.exception.code, 400)
+
+
+class HostCheckTest(unittest.TestCase):
+    # Bound to 127.0.0.2 (not 127.0.0.1) so "the bind address is allowed" and
+    # "loopback is always allowed" are genuinely two separate code paths --
+    # otherwise both would trivially pass off the same hardcoded LOOPBACK_HOSTS
+    # entry and the bind-address branch would never actually be exercised.
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = FakeEngine()
+        try:
+            cls.server = APIServer(("127.0.0.2", 0), cls.engine, "test-model", "secret", 16, kv_slots=1)
+        except OSError as e:
+            # 127.0.0.2 is bindable by default on Linux but not on macOS, whose
+            # loopback interface only auto-aliases 127.0.0.1 (a second address
+            # needs `sudo ifconfig lo0 alias 127.0.0.2 up`, which nothing here
+            # sets up). Skip rather than fail: the point of this address (see
+            # the class comment above) is a second real bind target distinct
+            # from LOOPBACK_HOSTS' hardcoded 127.0.0.1, not this specific IP.
+            raise unittest.SkipTest(f"127.0.0.2 not bindable on this platform: {e}")
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.scheduler.close()
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def _status(self, host_header):
+        conn = http.client.HTTPConnection("127.0.0.2", self.server.server_port, timeout=2)
+        try:
+            conn.request("GET", "/v1/models", headers={"Authorization": "Bearer secret", "Host": host_header})
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def test_bind_address_is_allowed(self):
+        self.assertEqual(self._status(f"127.0.0.2:{self.server.server_port}"), 200)
+
+    def test_loopback_always_allowed_even_off_bind_address(self):
+        for host in ("127.0.0.1", "localhost", "[::1]"):
+            self.assertEqual(self._status(host), 200, host)
+
+    def test_other_host_rejected_by_default(self):
+        self.assertEqual(self._status("evil.example.com"), 403)
+
+    def test_coli_allowed_hosts_extends_allowlist(self):
+        with patch.dict(os.environ, {"COLI_ALLOWED_HOSTS": "r720.tailc7f4a.ts.net"}):
+            self.assertEqual(self._status("r720.tailc7f4a.ts.net"), 200)
+        # gate stays closed again once the env var reverts to its default-off state
+        self.assertEqual(self._status("r720.tailc7f4a.ts.net"), 403)
+
+    def test_case_insensitive_and_ignores_blanks(self):
+        with patch.dict(os.environ, {"COLI_ALLOWED_HOSTS": " , R720.TailC7f4a.TS.net ,, "}):
+            self.assertEqual(self._status("r720.tailc7f4a.ts.net"), 200)
 
 
 class StaticServingTest(unittest.TestCase):

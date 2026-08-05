@@ -57,6 +57,14 @@
 #define cudaMemcpyPeer           hipMemcpyPeer
 #define cudaMemcpyPeerAsync      hipMemcpyPeerAsync
 #define cudaMemsetAsync          hipMemsetAsync
+/* __shfl_down_sync(mask, var, delta): CUDA 9+'s mask-qualified warp shuffle.
+ * HIP's shuffle API predates the CUDA independent-thread-scheduling split and
+ * has no _sync/mask variant — __shfl_down(var, delta) already shuffles across
+ * every active lane, which is exactly what mask==0xffffffff (every caller in
+ * this file) asks for, so dropping the mask is a direct, safe equivalence
+ * for how it's actually used here. Not a general-purpose substitute for a
+ * partial/divergent mask, which this codebase doesn't use. */
+#define __shfl_down_sync(mask, var, delta) __shfl_down(var, delta)
 #else
 #include <cuda_runtime.h>
 #include <mma.h>

@@ -1178,7 +1178,10 @@ class Engine:
                     self.hits = fields[3]
                     self.hits_seq += 1
                 elif kind == "PROF" and len(fields) >= 10:
-                    # per-turn phase timings: where the engine spent this turn's wall time
+                    # per-turn phase timings: where the engine spent this turn's wall time.
+                    # gpu_miss_hits/fallback (fields 10/11) are trailing and optional -- an
+                    # older engine binary built before CUDA_MISS_GPU's telemetry only sends
+                    # 10 fields, so these default to 0 rather than requiring len(fields) >= 12.
                     self.profile.append({
                         "wall_s": float(fields[1]),
                         "prompt_tokens": int(fields[2]),
@@ -1189,6 +1192,8 @@ class Engine:
                         "attention_s": float(fields[7]),
                         "lm_head_s": float(fields[8]),
                         "forwards": int(fields[9]),
+                        "gpu_miss_hits": int(fields[10]) if len(fields) >= 11 else 0,
+                        "gpu_miss_fallback": int(fields[11]) if len(fields) >= 12 else 0,
                     })
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
@@ -1373,7 +1378,14 @@ class APIHandler(BaseHTTPRequestHandler):
     def _check_host(self):
         """DNS-rebinding guard: a web page can resolve a hostname to 127.0.0.1 and
         drive this local server unless we pin the Host header to loopback / the bind
-        address. Rejects requests whose Host is anything else. (#SEC-7)"""
+        address. Rejects requests whose Host is anything else. (#SEC-7)
+
+        The bind address alone isn't enough when listening on 0.0.0.0: the literal
+        string "0.0.0.0" is never a Host header any client sends, so a multi-interface
+        deployment (e.g. reachable on both a LAN IP and a tailnet address) has no
+        address to allowlist automatically. COLI_ALLOWED_HOSTS opts a deployment into
+        naming its other reachable hostnames/IPs explicitly -- empty by default, so
+        single-interface deployments are unaffected."""
         host = self.headers.get("Host", "")
         if host.startswith("["):
             name = host[1:].split("]", 1)[0]                       # [ipv6]:port
@@ -1387,6 +1399,9 @@ class APIHandler(BaseHTTPRequestHandler):
             allowed.add(str(self.server.server_address[0]).strip("[]").lower())
         except Exception:
             pass
+        extra = os.environ.get("COLI_ALLOWED_HOSTS", "")
+        if extra:
+            allowed.update(h.strip().lower() for h in extra.split(",") if h.strip())
         if name not in allowed:
             raise APIError(403, "Host header not allowed.", None, "forbidden")
 
