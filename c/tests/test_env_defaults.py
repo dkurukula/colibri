@@ -70,6 +70,23 @@ class EnvDefaultsTest(unittest.TestCase):
         for k in ("DIRECT", "PIPE", "PILOT_REAL", "OMP_WAIT_POLICY"):
             self.assertNotIn(k, e)
 
+    def test_linux_sets_omp_num_threads_from_physical_cores(self):
+        # libgomp falls back to nproc (LOGICAL cores) when OMP_NUM_THREADS is
+        # unset. On an SMT host that's a 2x over-subscription -- this is the
+        # one Windows-only default that must NOT stay Windows-only.
+        with mock.patch("resource_plan.physical_cpu_count", return_value=20):
+            e = self.env_for_with({}, "linux")
+        self.assertEqual(e["OMP_NUM_THREADS"], "20")
+
+    def test_linux_explicit_omp_num_threads_wins(self):
+        with mock.patch("resource_plan.physical_cpu_count", return_value=20):
+            e = self.env_for_with({"OMP_NUM_THREADS": "8"}, "linux")
+        self.assertEqual(e["OMP_NUM_THREADS"], "8")
+
+    def test_linux_no_omp_tune_leaves_thread_count_unset(self):
+        e = self.env_for_with({"COLI_NO_OMP_TUNE": "1"}, "linux")
+        self.assertNotIn("OMP_NUM_THREADS", e)
+
 
 class CudaAutoEnableTest(unittest.TestCase):
     """Windows bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS run
