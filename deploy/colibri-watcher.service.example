@@ -1,0 +1,11 @@
+[Unit]
+Description=colibri live-usage metrics collector (one-shot)
+After=colibri.service
+
+[Service]
+Type=oneshot
+Environment=COLI_API_KEY=REPLACE_WITH_THE_SAME_KEY_AS_colibri.service
+Environment=COLI_WATCH_HOST=127.0.0.1
+Environment=COLI_WATCH_PORT=8000
+Environment=COLI_SERVE_LOG=/path/to/colibri/serve.log
+ExecStart=/usr/bin/python3 /path/to/colibri/watcher/colibri_watcher.py
