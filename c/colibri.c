@@ -4518,6 +4518,24 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
+        else if(S<8){
+            /* Decode has NO liveness signal at all otherwise: a forward pass that
+             * hangs inside a single layer (stuck GPU sync, wedged lock, ...)
+             * produces total silence, indistinguishable from "still computing
+             * normally" until someone manually inspects the process. Emit at most
+             * one line per COLI_DECODE_HEARTBEAT_S (default 30s), whichever layer
+             * happens to be current -- if it hangs, that's the last layer we'll
+             * see logged, which is exactly the information a stuck decode is
+             * missing today. Off if set to 0. */
+            static double hb_interval=-1, last_hb=0;
+            if(hb_interval<0)
+                hb_interval=getenv("COLI_DECODE_HEARTBEAT_S")?atof(getenv("COLI_DECODE_HEARTBEAT_S")):30.0;
+            double now=now_s();
+            if(hb_interval>0 && now-last_hb>=hb_interval){
+                fprintf(stderr,"[decode] layer %d/%d · %d token in batch\n", i+1, c->n_layers, S);
+                last_hb=now;
+            }
+        }
 #ifdef COLI_CUDA
         Layer *l=&m->L[i];
         if(pipe2 && l->sparse && i<c->n_layers &&
