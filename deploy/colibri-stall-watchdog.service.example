@@ -1,0 +1,9 @@
+[Unit]
+Description=colibri engine stall detector (one-shot, alert-only)
+After=colibri.service
+
+[Service]
+Type=oneshot
+Environment=COLI_WATCH_HOST=127.0.0.1
+Environment=COLI_WATCH_PORT=8000
+ExecStart=/usr/bin/python3 /path/to/colibri/watcher/colibri_stall_watchdog.py

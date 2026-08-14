@@ -9,13 +9,16 @@ mkdir -p ~/.config/systemd/user
 cp colibri.service.example ~/.config/systemd/user/colibri.service
 cp colibri-watcher.service.example ~/.config/systemd/user/colibri-watcher.service
 cp colibri-watcher.timer.example ~/.config/systemd/user/colibri-watcher.timer
+cp colibri-stall-watchdog.service.example ~/.config/systemd/user/colibri-stall-watchdog.service
+cp colibri-stall-watchdog.timer.example ~/.config/systemd/user/colibri-stall-watchdog.timer
 mkdir -p /path/to/colibri/watcher
-cp watcher/colibri_watcher.py /path/to/colibri/watcher/
+cp watcher/colibri_watcher.py watcher/colibri_stall_watchdog.py /path/to/colibri/watcher/
 # edit the copied unit files: model path, host/port, RAM budget, API key
 loginctl enable-linger "$USER"   # so it keeps running without an active login session
 systemctl --user daemon-reload
 systemctl --user enable --now colibri.service
 systemctl --user enable --now colibri-watcher.timer
+systemctl --user enable --now colibri-stall-watchdog.timer
 ```
 
 ## Memory ceiling
@@ -55,3 +58,21 @@ judgment calls. Turning that log into concrete tuning or code proposals is a
 separate, human-in-the-loop step: read the log, look for patterns (latency
 drift, swap pressure trending up, recurring errors, expert hit rate), and
 decide what's worth changing.
+
+## The stall watchdog
+
+`watcher/colibri_stall_watchdog.py` detects a deadlocked engine process — a
+request that's stopped making progress but never errors, times out, or shows
+up in any log, because there's nothing in the decode path that reports
+liveness on its own. Frozen CPU/disk-IO counters alone don't mean much: an
+idle server with no request in flight looks identical at the `/proc` level
+(every worker thread legitimately parked in a blocking wait). The signal that
+actually means something is frozen counters *while a real, non-loopback
+client connection is open* on the serve port — someone is waiting on a
+response and nothing is happening. After `COLI_STALL_SAMPLES` (default 5)
+consecutive one-minute checks in that state, it appends an `ALERT` line plus
+a thread wait-channel snapshot (for post-mortem — which library/wait each
+thread is parked in) to `stall_watchdog.log`. Alert-only: it does not restart
+anything, by design — that's a decision for whatever's watching this log or
+an operator, not a silent, judgment-free reflex like the rest of this
+directory.
