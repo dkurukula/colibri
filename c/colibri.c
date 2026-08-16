@@ -1724,8 +1724,29 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
     /* rialloca se lo slot (riusato tra layer) e' troppo piccolo per QUESTO expert:
-     * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini */
-    if(!s->slab || wtot+8192 > s->slab_cap){
+     * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini
+     *
+     * ...and reallocate when it is too LARGE (ported from upstream #856). Slabs
+     * do not stay in the row that grew them: the LRU promotion swaps ws[q] with
+     * a cache slot ("promozione LRU" below), so a ws[] slot widened for a wider
+     * expert (e.g. an int8 MTP head next to int4 routed experts) comes back on
+     * the next token, loads a narrower expert without resizing, and is then
+     * swapped into a MAIN layer's cache -- still carrying the wider capacity.
+     * Given enough tokens, every cache slot in the model can end up costing the
+     * widest width ever loaded into it, silently inflating RSS past whatever
+     * cap_for_ram() assumed when it sized the slot count.
+     *
+     * Hysteresis, not exact fit: alignment rounding alone can make slab_cap
+     * exceed the request under COLI_METAL, and shrinking for a few KB would
+     * churn the allocator on every miss. 25% is relative so it scales with the
+     * model; the floor only has to clear that 16 KB rounding.
+     *
+     * Never arena slices (aslab): those are interior pointers into one
+     * per-layer allocation (#419) and must not be freed. They're already
+     * per-layer width, so there's nothing to shrink. */
+    int64_t want=wtot+8192;
+    int64_t hyst=want/4; if(hyst<(1<<16)) hyst=1<<16;   /* 64 KB clears the 16 KB METAL rounding */
+    if(!s->slab || want > s->slab_cap || (!s->aslab && s->slab_cap > want+hyst)){
 #ifdef COLI_METAL
         /* page-align + zero-copy wrap: the GPU reads this slab in place (unified memory) */
         if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
@@ -1741,7 +1762,10 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         numa_slab_bind(s->slab,(size_t)s->slab_cap);
 #endif
     }
-    if(!s->fslab || ftot > s->fslab_cap){
+    /* The scales migrate with their weights, so they shrink on the same rule.
+     * fslab_cap counts FLOATS, so the hysteresis is in floats too. */
+    int64_t fhyst=ftot/4; if(fhyst<(1<<14)) fhyst=1<<14;   /* floats, so 64 KB again */
+    if(!s->fslab || ftot > s->fslab_cap || (!s->afslab && s->fslab_cap > ftot+fhyst)){
 #ifdef COLI_METAL
         /* page-align + register: the GPU reads the scales in place (unified memory).
          * Honours `fatal` exactly like the CPU arm below — a speculative pilot load
@@ -1940,7 +1964,13 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
     int64_t ftot=(l->tq[0]->nbytes+l->tq[1]->nbytes+l->tq[2]->nbytes)/4;
     if(wtot<=0 || ftot<=0) return uring_load_error(l,EINVAL,"io_uring expert size"),li;
-    if(!s->slab || wtot+8192>s->slab_cap){
+    /* Same shrink rule as the pread path above (ported from upstream #856): a
+     * slot that once held a wider expert must not carry that width into a
+     * narrower row indefinitely, or actual RSS drifts past what cap_for_ram()
+     * assumed. Same hysteresis, same arena guard. */
+    int64_t want=wtot+8192, hyst=want/4; if(hyst<(1<<16)) hyst=1<<16;
+    int64_t fhyst=ftot/4; if(fhyst<(1<<14)) fhyst=1<<14;   /* floats, so 64 KB again */
+    if(!s->slab || want>s->slab_cap || (!s->aslab && s->slab_cap > want+hyst)){
 #ifdef COLI_METAL
         if(s->slab&&g_metal_enabled) coli_metal_unregister(s->slab);
         compat_aligned_free(s->slab);
@@ -1955,7 +1985,7 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         s->slab_cap=wtot+8192;
 #endif
     }
-    if(!s->fslab || ftot>s->fslab_cap){
+    if(!s->fslab || ftot>s->fslab_cap || (!s->afslab && s->fslab_cap > ftot+fhyst)){
 #ifdef COLI_METAL
         if(s->fslab&&g_metal_enabled) coli_metal_unregister(s->fslab);
         free(s->fslab); size_t fb=(((size_t)ftot*sizeof(float))+16383)&~(size_t)16383;

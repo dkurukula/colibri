@@ -205,7 +205,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_repin$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE) tests/test_qt_shape_eq$(EXE) tests/test_autopin_lru$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_repin$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE) tests/test_qt_shape_eq$(EXE) tests/test_autopin_lru$(EXE) tests/test_expert_slab_shrink$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -469,6 +469,9 @@ tests/test_qt_shape_eq$(EXE): tests/test_qt_shape_eq.c colibri.c st.h uring.h js
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_autopin_lru$(EXE): tests/test_autopin_lru.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_expert_slab_shrink$(EXE): tests/test_expert_slab_shrink.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
