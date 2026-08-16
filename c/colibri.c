@@ -955,6 +955,10 @@ static void *qalloc(size_t n){
 static float *qsalloc(int O){ return (float*)qalloc((size_t)O*sizeof(float)); }
 static int g_pilot_real=0;/* PILOT_REAL=1: il pilota fa LOAD VERI cross-layer dentro ecache[L+1]
                           * (non il semplice WILLNEED). Implica PILOT=1. Default OFF: hint-only. */
+static int g_in_decode_step=0; /* set only around the two genuine per-token decode forwards
+                                * (spec_decode's step_all, step_decode_batch's direct call) --
+                                * small S alone doesn't mean decode: a short unchunked prompt
+                                * prefills through plain step() with the same small S. */
 static int g_pilot_two=0; /* PILOT_TWO=1: two-step prefetch — before running L+1's router,
                           * approximate MoE(L) using only the shared expert (resident, no disk)
                           * and add it to the state. Trades 3 small matmuls for +2.3% recall. */
@@ -4518,7 +4522,7 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
-        else if(S<8){
+        else if(S<8 && g_in_decode_step){
             /* Decode has NO liveness signal at all otherwise: a forward pass that
              * hangs inside a single layer (stuck GPU sync, wedged lock, ...)
              * produces total silence, indistinguishable from "still computing
@@ -4526,7 +4530,12 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
              * one line per COLI_DECODE_HEARTBEAT_S (default 30s), whichever layer
              * happens to be current -- if it hangs, that's the last layer we'll
              * see logged, which is exactly the information a stuck decode is
-             * missing today. Off if set to 0. */
+             * missing today. Off if set to 0.
+             * g_in_decode_step (not just S<8) gates this: a short unchunked
+             * prompt prefills through plain step() with the same small S, and
+             * without this guard gets mislabeled [decode] -- confirmed live: a
+             * 5-token prefill on this hardware took 6 minutes and was reported
+             * as decode for the whole span before this fix. */
             static double hb_interval=-1, last_hb=0;
             if(hb_interval<0)
                 hb_interval=getenv("COLI_DECODE_HEARTBEAT_S")?atof(getenv("COLI_DECODE_HEARTBEAT_S")):30.0;
@@ -4717,7 +4726,9 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
         kvs[s]=rows[s].kv; positions[s]=rows[s].pos;
         embed_row(m,rows[s].token,x+(int64_t)s*D);
     }
+    g_in_decode_step=1;
     layers_forward_rows(m,x,S,0,kvs,positions);
+    g_in_decode_step=0;
     float *norm=falloc((int64_t)S*D);
     for(int s=0;s<S;s++)
         rmsnorm(norm+(int64_t)s*D,x+(int64_t)s*D,m->final_norm,D,c->eps);
@@ -4995,7 +5006,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(gsrc==1) g_grd.prop+=(uint64_t)g;
         int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
         double tf0=g_prof?now_s():0;
+        g_in_decode_step=1;
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
+        g_in_decode_step=0;
         if(g_prof) prof_lat(now_s()-tf0);
         int k=0;                                        /* verifica: accetta finche' coincide */
         if(g>0 && getenv("MTP_DEBUG")){ int veri=argmax_v(lo,V);
