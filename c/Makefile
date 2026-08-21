@@ -346,6 +346,14 @@ miss-gpu-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h colibri.c tes
 	"$(GPUCC)" $(GPUFLAGS) -DCOLI_CUDA -Xcompiler -fopenmp backend_cuda.cu tests/test_cuda_miss_gpu.c -o tests/test_cuda_miss_gpu$(EXE)
 	./tests/test_cuda_miss_gpu$(EXE)
 
+# Async double-buffered counterpart of miss-gpu-test: coli_miss_gpu_issue/take
+# (tests/test_cuda_miss_issue.c). Same build shape (colibri.c through nvcc's
+# host-C path alongside backend_cuda.cu), same no-GPU skip (exit 77).
+miss-issue-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h colibri.c tests/test_cuda_miss_issue.c
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_CUDA -Xcompiler -fopenmp backend_cuda.cu tests/test_cuda_miss_issue.c -o tests/test_cuda_miss_issue$(EXE)
+	./tests/test_cuda_miss_issue$(EXE)
+
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
 hip-test:
 	$(MAKE) cuda-test HIP=1
@@ -573,4 +581,4 @@ bench-cpu-tiers:
 quickstart:
 	bash scripts/quickstart.sh $(ARGS)
 
-.PHONY: all colibri glm cuda-test hip-test gpu-compile cuda-bench cuda-dll portable portable-avx test-c test-python test check clean install uninstall bench bench-cpu-tiers quickstart
+.PHONY: all colibri glm cuda-test hip-test gpu-compile cuda-bench cuda-dll portable portable-avx test-c test-python test check clean install uninstall bench bench-cpu-tiers quickstart miss-gpu-test miss-issue-test

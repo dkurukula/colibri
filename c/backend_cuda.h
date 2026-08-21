@@ -94,6 +94,30 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            const int *rows, int count,
                            float *y, const float *x);
 
+/* Async issue/take split of a single CUDA_MISS_GPU expert dispatch, for a
+ * caller-managed ring of `slot` in [0,COLI_CUDA_MISS_SLOTS). Unlike
+ * coli_cuda_expert_group_issue/take above, this pair owns the WEIGHT upload
+ * too: a miss expert is by definition not resident, so gw/gsc, uw/usc,
+ * dw/dsc (host pointers) get staged through slot-owned pinned buffers and
+ * copied device-side into the already-shaped rg/ru/rd tensors (same
+ * fixed-shape ring tensors coli_miss_gpu_try uploads once at cold start).
+ * Each slot owns its own stream and device scratch, so issuing slot 1 before
+ * taking slot 0 lets slot 1's H2D weight copy run on the GPU's copy engine
+ * concurrently with slot 0's kernels/D2H readback still in flight -- that
+ * overlap, not fewer sync calls, is the entire point (the miss path is
+ * transfer-dominated, not sync-tax-dominated like the resident group path
+ * above). take() returns a pointer valid until the NEXT issue on that same
+ * slot; caller must consume (accumulate) it before reissuing. Any issue
+ * failure leaves nothing pending for that slot and the caller falls back to
+ * the CPU path for that expert, exactly as coli_miss_gpu_try does today. */
+#define COLI_CUDA_MISS_SLOTS 2
+COLI_CUDA_DLLEXPORT int coli_cuda_miss_issue(int slot, int device,
+                               ColiCudaTensor *rg, const void *gw, const float *gsc,
+                               ColiCudaTensor *ru, const void *uw, const float *usc,
+                               ColiCudaTensor *rd, const void *dw, const float *dsc,
+                               const float *x, int nr);
+COLI_CUDA_DLLEXPORT const float *coli_cuda_miss_take(int slot, int device);
+
 /* Decode-only MLA weight-absorption core for one token. kv_b is [H*(Q+V),K]. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,
                                const float *latent,const float *rope,int H,int Q,
