@@ -368,6 +368,15 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
 	./backend_cuda_bench$(EXE)
 
+# CPU/GPU concurrency microbenchmark for the COLI_MISS_CPU_EVERY prototype
+# (tests/bench_miss_cpu_gpu_split.c): plain C + libcudart, no device kernels,
+# so it builds with $(CC) rather than $(GPUCC) even under COLI_CUDA.
+miss-cpu-gpu-bench: tests/bench_miss_cpu_gpu_split.c quant.h
+	@test -n "$(CUDA_HOME)" || { echo "set CUDA_HOME" >&2; exit 1; }
+	$(CC) -O3 -fopenmp tests/bench_miss_cpu_gpu_split.c -o tests/bench_miss_cpu_gpu_split$(EXE) \
+		-I$(CUDA_HOME)/include -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lm
+	./tests/bench_miss_cpu_gpu_split$(EXE)
+
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
@@ -581,4 +590,4 @@ bench-cpu-tiers:
 quickstart:
 	bash scripts/quickstart.sh $(ARGS)
 
-.PHONY: all colibri glm cuda-test hip-test gpu-compile cuda-bench cuda-dll portable portable-avx test-c test-python test check clean install uninstall bench bench-cpu-tiers quickstart miss-gpu-test miss-issue-test
+.PHONY: all colibri glm cuda-test hip-test gpu-compile cuda-bench cuda-dll portable portable-avx test-c test-python test check clean install uninstall bench bench-cpu-tiers quickstart miss-gpu-test miss-issue-test miss-cpu-gpu-bench
