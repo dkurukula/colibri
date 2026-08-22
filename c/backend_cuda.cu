@@ -874,9 +874,19 @@ extern "C" int coli_cuda_miss_issue(int slot, int device,
     if (!ms->stream && !cuda_ok(cudaStreamCreateWithFlags(&ms->stream, cudaStreamNonBlocking),
                                  "miss slot stream creation")) return 0;
     int D = rg->I, I = rg->O;
-    size_t gwb = rg->weight_bytes, gsb = rg->scale_count * sizeof(float);
-    size_t uwb = ru->weight_bytes, usb = ru->scale_count * sizeof(float);
-    size_t dwb = rd->weight_bytes, dsb = rd->scale_count * sizeof(float);
+    /* scale_count is set unconditionally at upload time regardless of fmt
+     * (see coli_cuda_tensor_upload) -- only fmt!=0 tensors actually have a
+     * device `scales` allocation (coli_cuda_tensor_update's own scale copy
+     * is gated on `!tensor->fmt ||`, not on scale_count). fmt==0 (F32) has
+     * no scales at all; gating on scale_count here would stage/copy from
+     * whatever the caller's scale pointer happens to be for an F32 tensor
+     * -- for the miss ring that's always non-NULL in production (routed
+     * experts are never fmt=0), but treating a NULL caller scale pointer as
+     * "no scales" only by accident of fmt is exactly the kind of assumption
+     * this shouldn't rest on; gate explicitly, matching qt_cuda_update. */
+    size_t gwb = rg->weight_bytes, gsb = rg->fmt ? rg->scale_count * sizeof(float) : 0;
+    size_t uwb = ru->weight_bytes, usb = ru->fmt ? ru->scale_count * sizeof(float) : 0;
+    size_t dwb = rd->weight_bytes, dsb = rd->fmt ? rd->scale_count * sizeof(float) : 0;
     size_t xb = (size_t)nr * D * sizeof(float), yb = (size_t)nr * D * sizeof(float);
     size_t ib = (size_t)nr * I * sizeof(float);
     if (!reserve_pinned_bytes(&ms->host_gw, &ms->host_gw_cap, gwb) ||
