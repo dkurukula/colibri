@@ -388,6 +388,26 @@ static int qt_cuda_update(QT *t){
  * Any failure (ring init, upload, compute) falls back to the CPU path one
  * layer up — this must never turn a cache miss into a hard failure. */
 static int g_cuda_miss_gpu;
+/* COLI_MISS_CPU_EVERY: fixed-ratio CPU/GPU split prototype for decode misses
+ * (nr==1 only), inspired by FreeToken's bandwidth-adaptive q* policy (its
+ * §3.2: divide each step's cache misses between PCIe transfer and in-place
+ * CPU execution, run concurrently, per a measured-bandwidth ratio). This is
+ * NOT that policy -- it's a fixed, env-tunable "route 1 in N eligible misses
+ * straight to the existing CPU path instead of attempting a GPU issue"
+ * increment, meant to answer one question first: does concurrent CPU+GPU
+ * expert execution contend enough on shared host DRAM bandwidth to matter on
+ * this hardware? A dynamic q* computed from measured B_PCIe/B_cpu is a
+ * follow-up once that's answered, not this. 0 (default, unset): disabled,
+ * every eligible miss attempts GPU first, matching pre-existing behavior --
+ * this prototype changes nothing unless explicitly turned on. The CPU-routed
+ * expert uses the SAME synchronous expert_gate_up/matmul_qt path as the
+ * ordinary GPU-issue-failed fallback, unchanged; only which experts reach it
+ * is new. Because GPU issue is non-blocking (coli_cuda_miss_issue enqueues
+ * async work and returns), a CPU-routed expert computed in the SAME loop
+ * iteration as a still-in-flight GPU-issued one runs genuinely concurrently
+ * with it, using CPU threads the GPU work never touches. */
+static int g_miss_cpu_every=-1;
+static uint64_t g_miss_cpu_counter;
 #define COLI_MISS_RING_N COLI_CUDA_MISS_SLOTS   /* must match backend_cuda.h's async slot count */
 static QT g_miss_ring_g[COLI_MISS_RING_N], g_miss_ring_u[COLI_MISS_RING_N], g_miss_ring_d[COLI_MISS_RING_N];
 static int g_miss_ring_state;   /* 0=untried, 1=ready, -1=failed (e.g. fmt 5/6 has no CUDA kernel) */
@@ -3729,7 +3749,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * expert that turns out not to be a miss itself -- draining is independent
              * of this iteration's own path). This is what lets miss_gpu_drain's rare
              * take()-failure fallback reuse that scratch safely. */
-            int miss_slot = -1;
+            int miss_slot = -1, miss_force_cpu = 0;
             if(g_cuda_miss_gpu && g_cuda_enabled && !omp_in_parallel()){
                 miss_slot = g_miss_ring_rr % COLI_MISS_RING_N;
                 if(miss_pend_e[miss_slot]){
@@ -3737,6 +3757,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     miss_gpu_drain(m,layer,pe,miss_rows[miss_slot],miss_rw[miss_slot],miss_nr[miss_slot],
                                     out,D,I,S,xg,gg,uu,hh,&xe,x,g_cuda_devices[0],miss_slot);
                 }
+                if(g_miss_cpu_every<0)
+                    g_miss_cpu_every=getenv("COLI_MISS_CPU_EVERY")?atoi(getenv("COLI_MISS_CPU_EVERY")):0;
+                if(g_miss_cpu_every>0 && (g_miss_cpu_counter++ % (uint64_t)g_miss_cpu_every)==0)
+                    miss_force_cpu = 1;
             }
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
             if(group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible &&
@@ -3791,8 +3815,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * untiled kernel, flat from nr=8 through nr=1024
              * (tests/bench_expert_mlp_tiled.cu on this exact card). That
              * already amortizes the weight transfer across many rows, so
-             * double-buffering it is a separate, unscoped follow-up. */
-            if(g_cuda_miss_gpu && g_cuda_enabled && !omp_in_parallel() && nr==1 && miss_slot>=0 &&
+             * double-buffering it is a separate, unscoped follow-up.
+             *
+             * !miss_force_cpu: COLI_MISS_CPU_EVERY prototype (see the global
+             * declaration) routes a fixed fraction of eligible misses past
+             * this attempt entirely, straight to the ordinary CPU fallback
+             * below -- concurrently with whatever this loop already issued
+             * to the GPU in an earlier iteration and hasn't drained yet. */
+            if(!miss_force_cpu && g_cuda_miss_gpu && g_cuda_enabled && !omp_in_parallel() && nr==1 && miss_slot>=0 &&
                coli_miss_gpu_issue(e,xg,nr,g_cuda_devices[0],miss_slot)){
                 g_miss_ring_rr++;
                 memcpy(miss_rows[miss_slot],rows,(size_t)nr*sizeof(int));
