@@ -31,6 +31,24 @@ struct ColiCudaTensor {
     int ragged_count;
 };
 
+/* One CUDA_MISS_GPU async slot's private state: its own stream + device
+ * scratch + pinned host staging, so two slots can have work in flight on the
+ * GPU at once (see coli_cuda_miss_issue/take doc comment in backend_cuda.h).
+ * Deliberately NOT shared with DeviceContext's own x/y/gate/up scratch --
+ * those are reused synchronously by coli_cuda_matmul/expert_mlp elsewhere in
+ * this file, and a slot's async kernels are still running against them long
+ * after this function returns, so sharing would let a second in-flight slot
+ * (or an unrelated sync call) overwrite a still-in-use buffer underneath a
+ * pending kernel. */
+typedef struct {
+    cudaStream_t stream;
+    void  *host_gw,*host_uw,*host_dw; size_t host_gw_cap,host_uw_cap,host_dw_cap;
+    float *host_gs,*host_us,*host_ds; size_t host_gs_cap,host_us_cap,host_ds_cap;
+    float *host_x,*host_y; size_t host_x_cap,host_y_cap;
+    float *dx,*dy,*dgate,*dup; size_t dx_cap,dy_cap,dgate_cap,dup_cap;
+    int pending;
+} MissSlot;
+
 typedef struct {
     int device;
     int compute_major,compute_minor;
@@ -46,6 +64,7 @@ typedef struct {
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
+    MissSlot miss[COLI_CUDA_MISS_SLOTS];
 } DeviceContext;
 
 typedef struct {
@@ -554,6 +573,11 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
 }
 
+static int reserve_pinned_bytes(void **ptr,size_t *cap,size_t bytes){
+    if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
+    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned weight staging allocation"))return 0;*cap=bytes;return 1;
+}
+
 extern "C" int coli_cuda_init(const int *devices, int count) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
     /* #509: the ROCm runtime (comgr, MIOpen, roctracer) reads $TEMP as a temp-dir
@@ -618,6 +642,18 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
+        for(int s=0;s<COLI_CUDA_MISS_SLOTS;s++){
+            MissSlot *ms=&ctx->miss[s];
+            if(ms->dx) cudaFree(ms->dx); if(ms->dy) cudaFree(ms->dy);
+            if(ms->dgate) cudaFree(ms->dgate); if(ms->dup) cudaFree(ms->dup);
+            if(ms->host_gw) cudaFreeHost(ms->host_gw); if(ms->host_uw) cudaFreeHost(ms->host_uw);
+            if(ms->host_dw) cudaFreeHost(ms->host_dw);
+            if(ms->host_gs) cudaFreeHost(ms->host_gs); if(ms->host_us) cudaFreeHost(ms->host_us);
+            if(ms->host_ds) cudaFreeHost(ms->host_ds);
+            if(ms->host_x) cudaFreeHost(ms->host_x); if(ms->host_y) cudaFreeHost(ms->host_y);
+            if(ms->stream) cudaStreamDestroy(ms->stream);
+            memset(ms, 0, sizeof(*ms));
+        }
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
@@ -810,6 +846,108 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
         !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
     return 1;
+}
+
+/* See doc comment in backend_cuda.h. gw/uw/dw are raw weight bytes matching
+ * rg/ru/rd's existing weight_bytes (same fixed fmt/I/O the ring tensor was
+ * originally uploaded with -- caller's qt_shape_eq guard, unchanged); gsc/
+ * usc/dsc are per-tensor scales, NULL/ignored when that tensor's fmt has none
+ * (weight_bytes/scale_count are 0-safe already). Everything is staged
+ * through this slot's OWN pinned buffers via a synchronous host-to-host
+ * memcpy before any device call, so the caller's source buffers (an ESlot's
+ * host-side slab) are safe to reuse/evict the moment this function returns --
+ * the async device work below has already taken its own copy. */
+extern "C" int coli_cuda_miss_issue(int slot, int device,
+                                     ColiCudaTensor *rg, const void *gw, const float *gsc,
+                                     ColiCudaTensor *ru, const void *uw, const float *usc,
+                                     ColiCudaTensor *rd, const void *dw, const float *dsc,
+                                     const float *x, int nr) {
+    if (fault_injected()) return 0;
+    if (slot < 0 || slot >= COLI_CUDA_MISS_SLOTS || !rg || !ru || !rd || !gw || !uw || !dw || !x || nr < 1)
+        return 0;
+    if ((rg->fmt && !gsc) || (ru->fmt && !usc) || (rd->fmt && !dsc)) return 0;
+    if (rg->device != device || ru->device != device || rd->device != device) return 0;
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx) return 0;
+    MissSlot *ms = &ctx->miss[slot];
+    if (ms->pending || !select_ctx(ctx)) return 0;
+    if (!ms->stream && !cuda_ok(cudaStreamCreateWithFlags(&ms->stream, cudaStreamNonBlocking),
+                                 "miss slot stream creation")) return 0;
+    int D = rg->I, I = rg->O;
+    /* scale_count is set unconditionally at upload time regardless of fmt
+     * (see coli_cuda_tensor_upload) -- only fmt!=0 tensors actually have a
+     * device `scales` allocation (coli_cuda_tensor_update's own scale copy
+     * is gated on `!tensor->fmt ||`, not on scale_count). fmt==0 (F32) has
+     * no scales at all; gating on scale_count here would stage/copy from
+     * whatever the caller's scale pointer happens to be for an F32 tensor
+     * -- for the miss ring that's always non-NULL in production (routed
+     * experts are never fmt=0), but treating a NULL caller scale pointer as
+     * "no scales" only by accident of fmt is exactly the kind of assumption
+     * this shouldn't rest on; gate explicitly, matching qt_cuda_update. */
+    size_t gwb = rg->weight_bytes, gsb = rg->fmt ? rg->scale_count * sizeof(float) : 0;
+    size_t uwb = ru->weight_bytes, usb = ru->fmt ? ru->scale_count * sizeof(float) : 0;
+    size_t dwb = rd->weight_bytes, dsb = rd->fmt ? rd->scale_count * sizeof(float) : 0;
+    size_t xb = (size_t)nr * D * sizeof(float), yb = (size_t)nr * D * sizeof(float);
+    size_t ib = (size_t)nr * I * sizeof(float);
+    if (!reserve_pinned_bytes(&ms->host_gw, &ms->host_gw_cap, gwb) ||
+        !reserve_pinned_bytes(&ms->host_uw, &ms->host_uw_cap, uwb) ||
+        !reserve_pinned_bytes(&ms->host_dw, &ms->host_dw_cap, dwb) ||
+        (gsb && !reserve_pinned(&ms->host_gs, &ms->host_gs_cap, gsb)) ||
+        (usb && !reserve_pinned(&ms->host_us, &ms->host_us_cap, usb)) ||
+        (dsb && !reserve_pinned(&ms->host_ds, &ms->host_ds_cap, dsb)) ||
+        !reserve_pinned(&ms->host_x, &ms->host_x_cap, xb) ||
+        !reserve_pinned(&ms->host_y, &ms->host_y_cap, yb) ||
+        !reserve(&ms->dx, &ms->dx_cap, xb) || !reserve(&ms->dy, &ms->dy_cap, yb) ||
+        !reserve(&ms->dgate, &ms->dgate_cap, ib) || !reserve(&ms->dup, &ms->dup_cap, ib))
+        return 0;
+    std::memcpy(ms->host_gw, gw, gwb); std::memcpy(ms->host_uw, uw, uwb); std::memcpy(ms->host_dw, dw, dwb);
+    if (gsb) std::memcpy(ms->host_gs, gsc, gsb);
+    if (usb) std::memcpy(ms->host_us, usc, usb);
+    if (dsb) std::memcpy(ms->host_ds, dsc, dsb);
+    std::memcpy(ms->host_x, x, xb);
+    cudaStream_t s = ms->stream;
+    if (!cuda_ok(cudaMemcpyAsync(rg->weights, ms->host_gw, gwb, cudaMemcpyHostToDevice, s), "miss gate upload") ||
+        (gsb && !cuda_ok(cudaMemcpyAsync(rg->scales, ms->host_gs, gsb, cudaMemcpyHostToDevice, s), "miss gate scale upload")) ||
+        !cuda_ok(cudaMemcpyAsync(ru->weights, ms->host_uw, uwb, cudaMemcpyHostToDevice, s), "miss up upload") ||
+        (usb && !cuda_ok(cudaMemcpyAsync(ru->scales, ms->host_us, usb, cudaMemcpyHostToDevice, s), "miss up scale upload")) ||
+        !cuda_ok(cudaMemcpyAsync(rd->weights, ms->host_dw, dwb, cudaMemcpyHostToDevice, s), "miss down upload") ||
+        (dsb && !cuda_ok(cudaMemcpyAsync(rd->scales, ms->host_ds, dsb, cudaMemcpyHostToDevice, s), "miss down scale upload")))
+        return 0;
+    /* offset-binary -> signed nibble fix, same as qt_cuda_update's sync path,
+     * queued on this slot's stream so it waits for this slot's own upload. */
+    if (rg->fmt == 2 || rg->fmt == 4)
+        offset_to_signed_s4<<<(unsigned)((gwb + 255) / 256), 256, 0, s>>>((uint8_t*)rg->weights, gwb);
+    if (ru->fmt == 2 || ru->fmt == 4)
+        offset_to_signed_s4<<<(unsigned)((uwb + 255) / 256), 256, 0, s>>>((uint8_t*)ru->weights, uwb);
+    if (rd->fmt == 2 || rd->fmt == 4)
+        offset_to_signed_s4<<<(unsigned)((dwb + 255) / 256), 256, 0, s>>>((uint8_t*)rd->weights, dwb);
+    if (!cuda_ok(cudaGetLastError(), "miss weight refresh launch")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(ms->dx, ms->host_x, xb, cudaMemcpyHostToDevice, s), "miss input upload")) return 0;
+    dim3 hidden_grid((unsigned)I, (unsigned)nr), output_grid((unsigned)D, (unsigned)nr);
+    quant_matmul<<<hidden_grid, 256, 0, s>>>(ms->dgate, ms->dx, rg->weights, rg->scales,
+        rg->fmt, nr, D, I, row_bytes(rg->fmt, D), rg->gs, rg->ng);
+    quant_matmul<<<hidden_grid, 256, 0, s>>>(ms->dup, ms->dx, ru->weights, ru->scales,
+        ru->fmt, nr, D, I, row_bytes(ru->fmt, D), ru->gs, ru->ng);
+    size_t n = (size_t)nr * I;
+    silu_mul<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(ms->dgate, ms->dup, n);
+    quant_matmul<<<output_grid, 256, 0, s>>>(ms->dy, ms->dgate, rd->weights, rd->scales,
+        rd->fmt, nr, I, D, row_bytes(rd->fmt, I), rd->gs, rd->ng);
+    if (!cuda_ok(cudaGetLastError(), "miss expert mlp launch") ||
+        !cuda_ok(cudaMemcpyAsync(ms->host_y, ms->dy, yb, cudaMemcpyDeviceToHost, s), "miss output download"))
+        return 0;
+    ms->pending = 1;
+    return 1;
+}
+
+extern "C" const float *coli_cuda_miss_take(int slot, int device) {
+    if (slot < 0 || slot >= COLI_CUDA_MISS_SLOTS) return nullptr;
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !ctx->miss[slot].pending) return nullptr;
+    MissSlot *ms = &ctx->miss[slot];
+    ms->pending = 0;
+    if (!select_ctx(ctx)) return nullptr;
+    if (!cuda_ok(cudaStreamSynchronize(ms->stream), "miss slot take sync")) return nullptr;
+    return ms->host_y;
 }
 
 /* Prototype: coli_cuda_expert_mlp using quant_matmul_tiled instead of

@@ -388,7 +388,7 @@ static int qt_cuda_update(QT *t){
  * Any failure (ring init, upload, compute) falls back to the CPU path one
  * layer up — this must never turn a cache miss into a hard failure. */
 static int g_cuda_miss_gpu;
-#define COLI_MISS_RING_N 2
+#define COLI_MISS_RING_N COLI_CUDA_MISS_SLOTS   /* must match backend_cuda.h's async slot count */
 static QT g_miss_ring_g[COLI_MISS_RING_N], g_miss_ring_u[COLI_MISS_RING_N], g_miss_ring_d[COLI_MISS_RING_N];
 static int g_miss_ring_state;   /* 0=untried, 1=ready, -1=failed (e.g. fmt 5/6 has no CUDA kernel) */
 static int g_miss_ring_rr;
@@ -450,6 +450,37 @@ static int coli_miss_gpu_try(const ESlot *e, float *y, const float *xg, int nr, 
     return 1;
 }
 
+static const void *qt_weights_ptr(const QT *t){
+    return t->fmt==0 ? (const void*)t->qf : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+}
+/* Async, double-buffered counterpart of coli_miss_gpu_try, decode-scale only
+ * (nr==1 -- see call site: prefill's nr>1 batches stay on the synchronous
+ * tiled path above, which already amortizes the weight transfer across many
+ * rows and isn't the case this targets). issue() stages this expert's
+ * weights/scales/input into `slot`'s pinned buffers and returns without
+ * waiting for the GPU; take() must be called later (by the caller's own
+ * round-robin bookkeeping) to sync and collect the result before the ring
+ * position is reused for the NEXT issue. Same ring tensors and shape guard
+ * as coli_miss_gpu_try -- these functions only differ in sync vs async, not
+ * in which device tensors they refresh. */
+static int coli_miss_gpu_issue(const ESlot *e, const float *xg, int nr, int device, int slot){
+    if(g_miss_ring_state==0) g_miss_ring_state = miss_ring_init(e,device) ? 1 : -1;
+    if(g_miss_ring_state<0) return 0;
+    if(!qt_shape_eq(&e->g,&g_miss_ring_g[0]) || !qt_shape_eq(&e->u,&g_miss_ring_u[0]) ||
+       !qt_shape_eq(&e->d,&g_miss_ring_d[0])){
+        g_miss_gpu_shape_mismatch++;
+        return 0;
+    }
+    QT *rg=&g_miss_ring_g[slot], *ru=&g_miss_ring_u[slot], *rd=&g_miss_ring_d[slot];
+    return coli_cuda_miss_issue(slot, device,
+        rg->cuda, qt_weights_ptr(&e->g), e->g.s,
+        ru->cuda, qt_weights_ptr(&e->u), e->u.s,
+        rd->cuda, qt_weights_ptr(&e->d), e->d.s,
+        xg, nr);
+}
+static const float *coli_miss_gpu_take(int slot, int device){
+    return coli_cuda_miss_take(slot, device);
+}
 static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-window split (OVL report) */
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
@@ -2981,6 +3012,51 @@ static int router_best_or_fallback(int best, int kk, int E, int layer){
     return kk<E ? kk : 0;
 }
 
+#ifdef COLI_CUDA
+/* Drain one pending miss-GPU async slot: sync its stream and either
+ * accumulate the GPU result into `out`, or -- on the rare async failure --
+ * recompute the same expert on the CPU, mirroring the ordinary synchronous
+ * CPU-fallback logic at this function's own call site. That fallback has to
+ * be reachable from here too: by the time a caller finds out take() failed,
+ * the issue already reported success, so this IS the only remaining chance
+ * to honor "a miss must never silently drop its contribution" for this
+ * expert. `xg`/`gg`/`uu`/`hh` are moe()'s own per-call scratch, reused here
+ * exactly as the synchronous fallback reuses them -- safe because every
+ * caller of this function drains a slot before that same scratch is
+ * (re)written for a new expert this iteration (see call sites). Placed here
+ * (right before moe(), its only caller) rather than alongside
+ * coli_miss_gpu_issue above: it calls expert_host_ensure/expert_gate_up/
+ * falloc/siluf/matmul_qt/g_prof, all defined later in this file. */
+static void miss_gpu_drain(Model *m, int layer, ESlot *pe, const int *prows, const float *prw, int pnr,
+                            float *out, int D, int I, int S, float *xg, float *gg, float *uu, float *hh,
+                            float **xe, const float *x, int device, int slot){
+    const float *hy=coli_miss_gpu_take(slot,device);
+    if(hy){
+        for(int r=0;r<pnr;r++){ float *os=out+(int64_t)prows[r]*D, wgt=prw[r];
+            const float *hr=hy+(int64_t)r*D;
+            for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+        g_miss_gpu_hits++;
+        return;
+    }
+    g_miss_gpu_fallback++;
+    if(!pe->slab) expert_host_ensure(m,layer,pe);
+    const float *pxsrc=x;
+    if(pe->g.fmt==6){
+        if(!*xe){ *xe=falloc((int64_t)S*D); memcpy(*xe,x,(size_t)S*D*sizeof(float)); e8_rot_rows(*xe,S,D); }
+        pxsrc=*xe;
+    }
+    for(int r=0;r<pnr;r++) memcpy(xg+(int64_t)r*D, pxsrc+(int64_t)prows[r]*D, D*sizeof(float));
+    expert_gate_up(gg,uu,xg,&pe->g,&pe->u,pnr);
+    for(int64_t z=0;z<(int64_t)pnr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+    if(pe->d.fmt==6) e8_rot_rows(gg,pnr,I);
+    matmul_qt(hh,gg,&pe->d,pnr);
+    for(int r=0;r<pnr;r++){ float *os=out+(int64_t)prows[r]*D, wgt=prw[r], *hr=hh+(int64_t)r*D;
+        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+    if(g_prof){ m->cpu_expert_bytes+=qt_bytes(&pe->g)+qt_bytes(&pe->u)+qt_bytes(&pe->d);
+        m->cpu_expert_rows+=(uint64_t)pnr; }
+}
+#endif
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
@@ -3335,6 +3411,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                        * experts of the layer share it (the placement rule in quant.h) */
     int *rows=xalloc((size_t)S*sizeof(int),"moe rows"); float *rw=xalloc((size_t)S*sizeof(float),"moe rw");
 #ifdef COLI_CUDA
+    /* Double-buffered miss-GPU pipeline bookkeeping (decode nr==1 only, see
+     * coli_miss_gpu_issue). rows[]/rw[] above are reused every j iteration,
+     * so a slot's (row,weight) pairs must be snapshotted here at issue time
+     * -- they aren't consumed until that slot's take(), which can be a later
+     * iteration. Sized to the same S bound as rows[]/rw[] themselves. */
+    int *miss_rows[COLI_MISS_RING_N]; float *miss_rw[COLI_MISS_RING_N];
+    int miss_nr[COLI_MISS_RING_N]={0}; ESlot *miss_pend_e[COLI_MISS_RING_N]={NULL};
+    for(int mi=0;mi<COLI_MISS_RING_N;mi++){
+        miss_rows[mi]=xalloc((size_t)S*sizeof(int),"moe miss_rows");
+        miss_rw[mi]=xalloc((size_t)S*sizeof(float),"moe miss_rw");
+    }
     /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
      * questo, 9343 expert in VRAM restavano INUTILIZZATI durante il prefill
      * (misurato: 81s di expert-matmul tutto su CPU, GPU groups 21ms totali). */
@@ -3637,6 +3724,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
             if(!nr) continue;
 #ifdef COLI_CUDA
+            /* Double-buffered miss-GPU pipeline: pick this iteration's candidate ring
+             * slot and drain it BEFORE anything below touches xg/gg/uu/hh (even for an
+             * expert that turns out not to be a miss itself -- draining is independent
+             * of this iteration's own path). This is what lets miss_gpu_drain's rare
+             * take()-failure fallback reuse that scratch safely. */
+            int miss_slot = -1;
+            if(g_cuda_miss_gpu && g_cuda_enabled && !omp_in_parallel()){
+                miss_slot = g_miss_ring_rr % COLI_MISS_RING_N;
+                if(miss_pend_e[miss_slot]){
+                    ESlot *pe=miss_pend_e[miss_slot]; miss_pend_e[miss_slot]=NULL;
+                    miss_gpu_drain(m,layer,pe,miss_rows[miss_slot],miss_rw[miss_slot],miss_nr[miss_slot],
+                                    out,D,I,S,xg,gg,uu,hh,&xe,x,g_cuda_devices[0],miss_slot);
+                }
+            }
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
             if(group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible &&
                !omp_in_parallel()){
@@ -3665,22 +3766,42 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * cuda_eligible) and is being streamed from disk (or warm in the
              * host ecache) — try the GPU ring instead of the CPU path below.
              * xg already holds this expert's nr gathered rows (built above,
-             * same buffer the resident-tier call a few lines up uses) — S==1
-             * decode is just the nr==1 case of the same call.
+             * same buffer the resident-tier call a few lines up uses).
              *
-             * No nr cap: the previous commit capped this at nr<=64 after an
-             * uncapped nr>1 rollout regressed a real cold prefill live (22-25
-             * min/layer vs a 12-18 min/layer baseline) — root cause was
-             * quant_matmul's one-block-per-(output,row) design re-reading the
-             * weight row from GMEM once per row, multiplying traffic by nr on
-             * this card's 6 SMs. coli_miss_gpu_try now dispatches nr>1 to
-             * quant_matmul_tiled instead, which shares the dequantized weight
-             * row across a tile of rows in shared memory — measured 3.4-3.8x
-             * faster than the untiled kernel, flat from nr=8 through nr=1024
-             * (tests/bench_expert_mlp_tiled.cu on this exact card), so the
-             * regime the cap was protecting against is now the regime this
-             * wins in. */
-            if(g_cuda_miss_gpu && g_cuda_enabled && !omp_in_parallel() &&
+             * nr==1 (decode, S==1's only case): async double-buffered issue
+             * (coli_miss_gpu_issue) instead of a blocking call — this shape is
+             * transfer-dominated (~2.7ms weight move vs ~2.1ms compute per
+             * expert, measured on this card), so overlapping slot N+1's H2D
+             * upload with slot N's still-running kernel/readback is the actual
+             * win, not fewer sync calls. Issuing never blocks; the result is
+             * collected into out[] by a LATER iteration's drain above, or by
+             * the end-of-block drain for whichever one or two are still in
+             * flight when this block's unique experts run out.
+             *
+             * nr>1 (prefill miss batch): unchanged, stays on the synchronous
+             * tiled path below — no nr cap since the previous commit capped
+             * this at nr<=64 after an uncapped nr>1 rollout regressed a real
+             * cold prefill live (22-25 min/layer vs a 12-18 min/layer
+             * baseline) — root cause was quant_matmul's one-block-per-
+             * (output,row) design re-reading the weight row from GMEM once
+             * per row, multiplying traffic by nr on this card's 6 SMs.
+             * coli_miss_gpu_try dispatches nr>1 to quant_matmul_tiled
+             * instead, which shares the dequantized weight row across a tile
+             * of rows in shared memory — measured 3.4-3.8x faster than the
+             * untiled kernel, flat from nr=8 through nr=1024
+             * (tests/bench_expert_mlp_tiled.cu on this exact card). That
+             * already amortizes the weight transfer across many rows, so
+             * double-buffering it is a separate, unscoped follow-up. */
+            if(g_cuda_miss_gpu && g_cuda_enabled && !omp_in_parallel() && nr==1 && miss_slot>=0 &&
+               coli_miss_gpu_issue(e,xg,nr,g_cuda_devices[0],miss_slot)){
+                g_miss_ring_rr++;
+                memcpy(miss_rows[miss_slot],rows,(size_t)nr*sizeof(int));
+                memcpy(miss_rw[miss_slot],rw,(size_t)nr*sizeof(float));
+                miss_nr[miss_slot]=nr; miss_pend_e[miss_slot]=e;
+                double dt=now_s()-t0; m->t_emm+=dt; if(g_prof) m->t_egpu+=dt;
+                continue;
+            }
+            if(g_cuda_miss_gpu && g_cuda_enabled && !omp_in_parallel() && nr>1 &&
                coli_miss_gpu_try(e,hh,xg,nr,g_cuda_devices[0])){
                 for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
                     for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -3834,10 +3955,26 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(g_prof){double mx=0;for(int di=0;di<g_cuda_ndev;di++)if(dev_time[di]>mx)mx=dev_time[di];m->t_egpu+=mx;}
         m->t_emm+=now_s()-tg;
 #endif
+#ifdef COLI_CUDA
+        /* Mandatory full drain of any still-in-flight miss-GPU slots, unconditional
+         * (not "if reissued next iteration" like the lazy drain above) — required
+         * BEFORE the LRU swap just below, which can reassign a m->ws[] slot's
+         * CONTENTS (not just retire the pointer) to a different expert entirely. A
+         * pending slot's ESlot* (miss_pend_e) is a pointer INTO m->ws[]/pin/ecache,
+         * so any pending take() left across that swap would later read the wrong
+         * expert's fmt/shape in the rare take()-failure fallback inside
+         * miss_gpu_drain — not just wrong data, a live memory-safety hazard. */
+        for(int mi=0;mi<COLI_MISS_RING_N;mi++) if(miss_pend_e[mi]){
+            ESlot *pe=miss_pend_e[mi]; miss_pend_e[mi]=NULL;
+            miss_gpu_drain(m,layer,pe,miss_rows[mi],miss_rw[mi],miss_nr[mi],
+                            out,D,I,S,xg,gg,uu,hh,&xe,x,g_cuda_devices[0],mi);
+        }
+#endif
         /* No drain barrier: the per-expert pipe_wait(qof[j]) above (issued for every
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
          * for this block, so they are complete before the LRU swap — and the gen-tagged
-         * cursor keeps any still-spinning worker off a wrong-generation slot. */
+         * cursor keeps any still-spinning worker off a wrong-generation slot. The
+         * miss-GPU async ring above is drained the same way, for the same reason. */
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
@@ -3883,6 +4020,7 @@ shared_done:
 #ifdef COLI_CUDA
     free(group_x);free(group_y);
     free(group_row); free(group_weight);
+    for(int mi=0;mi<COLI_MISS_RING_N;mi++){ free(miss_rows[mi]); free(miss_rw[mi]); }
 #endif
 }
 
