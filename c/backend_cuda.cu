@@ -652,7 +652,7 @@ extern "C" void coli_cuda_shutdown(void) {
             if(ms->host_ds) cudaFreeHost(ms->host_ds);
             if(ms->host_x) cudaFreeHost(ms->host_x); if(ms->host_y) cudaFreeHost(ms->host_y);
             if(ms->stream) cudaStreamDestroy(ms->stream);
-            *ms=(MissSlot){};
+            memset(ms, 0, sizeof(*ms));
         }
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
