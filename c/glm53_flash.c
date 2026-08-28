@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,7 @@ typedef struct {
     shards *source;
     char *name;
     int streamed;
+    int cacheable; /* was ever load_matrix_mode(..., streamed=1): tracked in the expert LRU registry */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
@@ -279,6 +281,7 @@ static Matrix load_matrix_mode(Model *model, const char *name, int streamed) {
     matrix.view.columns = tensor->shape[1];
     matrix.source = &model->tensors;
     matrix.streamed = streamed;
+    matrix.cacheable = streamed;
     matrix.name = strdup(name);
     if (!matrix.name) die("glm53: matrix name allocation failed");
     if (tensor->dtype <= 2) {
@@ -340,36 +343,206 @@ static void matrix_free(Matrix *matrix) {
     free(matrix->name);
     memset(matrix, 0, sizeof(*matrix));
 }
+
+/* Streamed routed-expert weights used to be malloc'd, read from disk,
+ * matmul'd ONCE and freed on every single call -- no reuse across tokens,
+ * no reuse across the 8 experts/token that MoE routing locality would
+ * otherwise let us cache, and (CUDA) a fresh cudaMalloc/cudaMemcpy/cudaFree
+ * per call, which is what actually drove VRAM usage to climb monotonically
+ * and OOM the 4GB GTX 1050 Ti after enough calls -- cudaFree doesn't
+ * guarantee the allocator returns pool memory quickly enough to keep up
+ * with that churn rate.
+ *
+ * Fix: load a streamed matrix's data ONCE into the persistent Matrix struct
+ * itself (weight->data/scales, and weight->cuda gets populated lazily by
+ * the existing coli_cuda_matmul()->coli_cuda_tensor_upload() reuse-if-set
+ * path below -- no change needed there), then clear `streamed` so later
+ * calls on the SAME Matrix* (l->eg[e]/eu[e]/ed[e] are stable addresses,
+ * reused across every token) take the fast resident path. An LRU registry
+ * with a byte budget (GLM53_EXPERT_RAM_GB, default 8GB) evicts the coldest
+ * resident expert before a fresh one would push host RAM over budget --
+ * caching every expert unconditionally would mean holding the whole
+ * ~306GB checkpoint in RAM. */
+typedef struct { Matrix *matrix; uint64_t stamp; } ResidentSlot;
+static ResidentSlot *g_resident;
+static int g_resident_n, g_resident_cap;
+static size_t g_resident_bytes, g_resident_budget;
+static uint64_t g_resident_clock;
+static int g_resident_budget_read;
+#ifdef COLI_CUDA
+static void vram_cache_remove(Matrix *weight); /* defined below: keeps the VRAM
+    registry in sync when the RAM tier evicts (and thus cuda-frees) a matrix */
+#endif
+
+static void expert_cache_evict_one(void) {
+    if (!g_resident_n) return;
+    int victim = 0;
+    for (int i = 1; i < g_resident_n; i++)
+        if (g_resident[i].stamp < g_resident[victim].stamp) victim = i;
+    Matrix *m = g_resident[victim].matrix;
+    g_resident_bytes -= m->view.data_bytes + m->view.scale_bytes;
+#ifdef COLI_CUDA
+    vram_cache_remove(m);
+    coli_cuda_tensor_free(m->cuda);
+    m->cuda = NULL;
+#endif
+    free(m->data);
+    free(m->scales);
+    m->data = m->scales = NULL;
+    m->view.data = NULL;
+    m->view.scales = NULL;
+    m->streamed = 1;
+    g_resident[victim] = g_resident[--g_resident_n];
+}
+
+static void expert_cache_register(Matrix *weight) {
+    if (!g_resident_budget_read) {
+        const char *env = getenv("GLM53_EXPERT_RAM_GB");
+        double gb = env ? atof(env) : 8.0;
+        if (gb < 0.25) gb = 0.25;
+        g_resident_budget = (size_t)(gb * (1u << 30));
+        g_resident_budget_read = 1;
+    }
+    size_t need = weight->view.data_bytes + weight->view.scale_bytes;
+    while (g_resident_n && g_resident_bytes + need > g_resident_budget) expert_cache_evict_one();
+    if (g_resident_n == g_resident_cap) {
+        g_resident_cap = g_resident_cap ? g_resident_cap * 2 : 64;
+        g_resident = realloc(g_resident, (size_t)g_resident_cap * sizeof(*g_resident));
+        if (!g_resident) die("glm53: expert cache registry allocation failed");
+    }
+    g_resident[g_resident_n].matrix = weight;
+    g_resident[g_resident_n].stamp = ++g_resident_clock;
+    g_resident_n++;
+    g_resident_bytes += need;
+}
+
+static void expert_cache_touch(Matrix *weight) {
+    for (int i = 0; i < g_resident_n; i++)
+        if (g_resident[i].matrix == weight) {
+            g_resident[i].stamp = ++g_resident_clock;
+            return;
+        }
+}
+
+#ifdef COLI_CUDA
+/* Separate, smaller tier: host RAM residency (above) and VRAM residency are
+ * different budgets -- RAM defaults to 8GB, but this card has 4GB total, so
+ * without its own cap every RAM-resident expert would also try to stay
+ * VRAM-resident and hit a hard cudaMalloc ceiling forever (observed: silent
+ * fallback to CPU compute for every expert past that point, with the OOM
+ * message logged once per call). Evicting the VRAM copy only (coli_cuda_
+ * tensor_free) leaves the host-RAM copy alone -- a demoted expert still
+ * skips the disk read next time, just recomputes on CPU instead of GPU. */
+static ResidentSlot *g_vram_resident;
+static int g_vram_resident_n, g_vram_resident_cap;
+static size_t g_vram_bytes, g_vram_budget;
+static uint64_t g_vram_clock;
+static int g_vram_budget_read;
+
+static void vram_cache_evict_one(void) {
+    if (!g_vram_resident_n) return;
+    int victim = 0;
+    for (int i = 1; i < g_vram_resident_n; i++)
+        if (g_vram_resident[i].stamp < g_vram_resident[victim].stamp) victim = i;
+    Matrix *m = g_vram_resident[victim].matrix;
+    g_vram_bytes -= m->view.data_bytes + m->view.scale_bytes;
+    coli_cuda_tensor_free(m->cuda);
+    m->cuda = NULL;
+    g_vram_resident[victim] = g_vram_resident[--g_vram_resident_n];
+}
+
+/* Called BEFORE the upload attempt (weight->cuda still NULL): makes room. */
+static void vram_cache_reserve(Matrix *weight) {
+    if (!g_vram_budget_read) {
+        const char *env = getenv("CUDA_EXPERT_GB");
+        double gb = env ? atof(env) : 2.0;
+        if (gb < 0.1) gb = 0.1;
+        g_vram_budget = (size_t)(gb * (1u << 30));
+        g_vram_budget_read = 1;
+    }
+    size_t need = weight->view.data_bytes + weight->view.scale_bytes;
+    while (g_vram_resident_n && g_vram_bytes + need > g_vram_budget) vram_cache_evict_one();
+}
+
+/* Called AFTER a successful upload (weight->cuda now set): registers it. */
+static void vram_cache_register(Matrix *weight) {
+    if (g_vram_resident_n == g_vram_resident_cap) {
+        g_vram_resident_cap = g_vram_resident_cap ? g_vram_resident_cap * 2 : 64;
+        g_vram_resident = realloc(g_vram_resident, (size_t)g_vram_resident_cap * sizeof(*g_vram_resident));
+        if (!g_vram_resident) die("glm53: VRAM cache registry allocation failed");
+    }
+    g_vram_resident[g_vram_resident_n].matrix = weight;
+    g_vram_resident[g_vram_resident_n].stamp = ++g_vram_clock;
+    g_vram_resident_n++;
+    g_vram_bytes += weight->view.data_bytes + weight->view.scale_bytes;
+}
+
+static void vram_cache_touch(Matrix *weight) {
+    for (int i = 0; i < g_vram_resident_n; i++)
+        if (g_vram_resident[i].matrix == weight) {
+            g_vram_resident[i].stamp = ++g_vram_clock;
+            return;
+        }
+}
+
+/* Drops the VRAM-registry bookkeeping only -- does NOT free weight->cuda or
+ * touch VRAM itself; the caller (expert_cache_evict_one, on a RAM eviction)
+ * does that immediately after. Safe no-op if not currently VRAM-resident. */
+static void vram_cache_remove(Matrix *weight) {
+    for (int i = 0; i < g_vram_resident_n; i++)
+        if (g_vram_resident[i].matrix == weight) {
+            g_vram_bytes -= weight->view.data_bytes + weight->view.scale_bytes;
+            g_vram_resident[i] = g_vram_resident[--g_vram_resident_n];
+            return;
+        }
+}
+#endif
+
 static void matrix_multiply(float *output, const float *input, Matrix *weight, int rows) {
     if (weight->streamed) {
-        Matrix loaded = *weight;
-        loaded.streamed = 0;
-        loaded.name = NULL;
-        loaded.data = malloc(weight->view.data_bytes);
-        if (!loaded.data) die("glm53: streamed matrix allocation failed");
-        loaded.view.data = loaded.data;
+        weight->data = malloc(weight->view.data_bytes);
+        if (!weight->data) die("glm53: streamed matrix allocation failed");
+        weight->view.data = weight->data;
         if (weight->view.format == COLI_TENSOR_F32) {
-            st_read_f32_cap(weight->source, weight->name, loaded.data,
+            st_read_f32_cap(weight->source, weight->name, weight->data,
                             (int64_t)(weight->view.data_bytes / sizeof(float)), 1);
         } else {
-            loaded.scales = alloc_floats(weight->view.scale_bytes / sizeof(float));
-            loaded.view.scales = loaded.scales;
-            st_read_raw_cap(weight->source, weight->name, loaded.data, (int64_t)weight->view.data_bytes, 1);
+            weight->scales = alloc_floats(weight->view.scale_bytes / sizeof(float));
+            weight->view.scales = weight->scales;
+            st_read_raw_cap(weight->source, weight->name, weight->data, (int64_t)weight->view.data_bytes, 1);
             char scale_name[640];
             snprintf(scale_name, sizeof(scale_name), "%s_scale_inv", weight->name);
-            st_read_f32_cap(weight->source, scale_name, loaded.scales,
+            st_read_f32_cap(weight->source, scale_name, weight->scales,
                             (int64_t)(weight->view.scale_bytes / sizeof(float)), 1);
         }
-        matrix_multiply(output, input, &loaded, rows);
-        matrix_free(&loaded);
-        return;
+        weight->streamed = 0;
+        expert_cache_register(weight);
+    } else if (weight->cacheable) {
+        /* only ever-streamed matrices are tracked in the LRU registry --
+         * always-resident matrices (dense, attention, shared experts) never
+         * went through expert_cache_register, so skip the scan for those. */
+        expert_cache_touch(weight);
     }
     if (weight->view.format == COLI_TENSOR_F32) {
         matmul(output, input, weight->data, rows, (int)weight->view.columns, (int)weight->view.rows);
         return;
     }
 #ifdef COLI_CUDA
+    /* VRAM budget applies to EVERY CUDA-uploaded matrix, not just
+     * host-RAM-cacheable routed experts -- dense/shared/DSA-attention
+     * weights were reported at ~16.6GB total, which cannot fit in this 4GB
+     * card, and uploading them with no cap at all is what actually drove
+     * VRAM to its ceiling almost immediately (confirmed: gating this block
+     * on weight->cacheable "fixed" that but broke test_glm53_cuda_dispatch,
+     * which exercises matrix_multiply on a bare Matrix{0} that's never
+     * cacheable -- CUDA dispatch has to stay available for those too).
+     * One registry, uniform LRU: a dense/attention weight touched every
+     * single call naturally stays hot and is rarely the eviction victim; a
+     * routed expert used once every several tokens is. Self-balancing,
+     * no special-casing required. */
     if (g_cuda_enabled) {
+        int was_uploaded = weight->cuda != NULL;
+        if (!was_uploaded) vram_cache_reserve(weight);
         size_t count = (size_t)rows * weight->view.columns;
         float *activation = alloc_floats(count);
         int valid = 1;
@@ -381,6 +554,10 @@ static void matrix_multiply(float *output, const float *input, Matrix *weight, i
             valid && coli_cuda_matmul(&weight->cuda, output, activation, weight->view.data, weight->view.scales, 8,
                                       rows, (int)weight->view.columns, (int)weight->view.rows, g_cuda_device, 0);
         free(activation);
+        if (done) {
+            if (!was_uploaded) vram_cache_register(weight);
+            else vram_cache_touch(weight);
+        }
         if (done) return;
     }
 #endif
