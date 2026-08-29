@@ -523,25 +523,52 @@ static void vram_cache_remove(Matrix *weight) {
 }
 #endif
 
+/* Loads a streamed matrix's data from disk and registers it resident, or
+ * no-ops if it already is. Factored out of matrix_multiply so a background
+ * prefetch thread can call the exact same path the main thread would --
+ * safe to call from any thread PROVIDED two callers never target the SAME
+ * Matrix* concurrently (st_pread_full uses positional pread(), not a
+ * shared file cursor, so concurrent reads of DIFFERENT tensors on the same
+ * fd are fine; the registries are mutex-guarded above). The prefetch
+ * design below (ffn_forward) upholds that precondition by construction:
+ * top-k expert IDs within one token are guaranteed distinct (the router
+ * excludes already-picked experts), so the prefetch target is always a
+ * different Matrix than whatever the main thread is computing. */
+static void expert_cache_load(Matrix *weight) {
+    if (!weight->streamed) return;
+    weight->data = malloc(weight->view.data_bytes);
+    if (!weight->data) die("glm53: streamed matrix allocation failed");
+    weight->view.data = weight->data;
+    if (weight->view.format == COLI_TENSOR_F32) {
+        st_read_f32_cap(weight->source, weight->name, weight->data,
+                        (int64_t)(weight->view.data_bytes / sizeof(float)), 1);
+    } else {
+        weight->scales = alloc_floats(weight->view.scale_bytes / sizeof(float));
+        weight->view.scales = weight->scales;
+        st_read_raw_cap(weight->source, weight->name, weight->data, (int64_t)weight->view.data_bytes, 1);
+        char scale_name[640];
+        snprintf(scale_name, sizeof(scale_name), "%s_scale_inv", weight->name);
+        st_read_f32_cap(weight->source, scale_name, weight->scales,
+                        (int64_t)(weight->view.scale_bytes / sizeof(float)), 1);
+    }
+    weight->streamed = 0;
+    expert_cache_register(weight);
+}
+
+/* One prefetch slot: up to 3 tensors (an expert's gate/up/down), loaded
+ * sequentially on a background thread while the main thread computes a
+ * DIFFERENT expert. See ffn_forward for the issue/join pattern. */
+typedef struct { Matrix *targets[3]; int count; } PrefetchJob;
+
+static void *prefetch_thread_main(void *arg) {
+    PrefetchJob *job = arg;
+    for (int i = 0; i < job->count; i++) expert_cache_load(job->targets[i]);
+    return NULL;
+}
+
 static void matrix_multiply(float *output, const float *input, Matrix *weight, int rows) {
     if (weight->streamed) {
-        weight->data = malloc(weight->view.data_bytes);
-        if (!weight->data) die("glm53: streamed matrix allocation failed");
-        weight->view.data = weight->data;
-        if (weight->view.format == COLI_TENSOR_F32) {
-            st_read_f32_cap(weight->source, weight->name, weight->data,
-                            (int64_t)(weight->view.data_bytes / sizeof(float)), 1);
-        } else {
-            weight->scales = alloc_floats(weight->view.scale_bytes / sizeof(float));
-            weight->view.scales = weight->scales;
-            st_read_raw_cap(weight->source, weight->name, weight->data, (int64_t)weight->view.data_bytes, 1);
-            char scale_name[640];
-            snprintf(scale_name, sizeof(scale_name), "%s_scale_inv", weight->name);
-            st_read_f32_cap(weight->source, scale_name, weight->scales,
-                            (int64_t)(weight->view.scale_bytes / sizeof(float)), 1);
-        }
-        weight->streamed = 0;
-        expert_cache_register(weight);
+        expert_cache_load(weight);
     } else if (weight->cacheable) {
         /* only ever-streamed matrices are tracked in the LRU registry --
          * always-resident matrices (dense, attention, shared experts) never
@@ -982,7 +1009,33 @@ static void ffn_forward(const Config *c, Layer *l, const float *x, int n, float 
             weights[k] = score[best];
             total += weights[k];
         }
+        /* Prefetch expert k+1's weights on a background thread while the main
+         * thread computes expert k. The router already picked every ids[k]
+         * above, so by the time we start k=0 we already know all of them --
+         * nothing here waits on routing, only on disk. Joined before each
+         * compute, so a cold miss is never used half-loaded; a warm cache
+         * (expert_cache_load no-ops if already resident) just means the
+         * thread exits almost immediately and the join costs nothing real. */
+        pthread_t prefetch_thread;
+        int prefetch_pending = 0;
+        PrefetchJob job; /* reused each iteration; always joined before being
+                             overwritten or before this stack frame goes away */
         for (int k = 0; k < c->topk; k++) {
+            if (prefetch_pending) {
+                pthread_join(prefetch_thread, NULL);
+                prefetch_pending = 0;
+            }
+            if (k + 1 < c->topk) {
+                job.targets[0] = &l->eg[ids[k + 1]];
+                job.targets[1] = &l->eu[ids[k + 1]];
+                job.targets[2] = &l->ed[ids[k + 1]];
+                job.count = 3;
+                if (pthread_create(&prefetch_thread, NULL, prefetch_thread_main, &job) == 0)
+                    prefetch_pending = 1;
+                /* pthread_create failure (resource limits): fall through and let
+                 * matrix_multiply's own expert_cache_load cover k+1 synchronously
+                 * when its turn comes -- correctness intact, just no overlap. */
+            }
             weights[k] = weights[k] / (total + 1e-20f) * c->route_scale;
             mlp3(temp, row, &l->eg[ids[k]], &l->eu[ids[k]], &l->ed[ids[k]], 1, c->moe_inter, c->swiglu_limit);
             for (int d = 0; d < c->hidden; d++) out[(size_t)t * c->hidden + d] += weights[k] * temp[d];
