@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -374,7 +375,20 @@ static void vram_cache_remove(Matrix *weight); /* defined below: keeps the VRAM
     registry in sync when the RAM tier evicts (and thus cuda-frees) a matrix */
 #endif
 
-static void expert_cache_evict_one(void) {
+/* Guards BOTH registries (RAM and, below, VRAM) uniformly. Needed once a
+ * background prefetch thread (see expert_cache_load / ffn_forward) can
+ * call expert_cache_register concurrently with the main thread's own
+ * matrix_multiply -- and because a RAM eviction can cross-touch the VRAM
+ * registry (expert_cache_evict_one -> vram_cache_remove), even VRAM-tier
+ * bookkeeping that only the main thread normally reaches needs the same
+ * lock, or a prefetch-triggered RAM eviction could corrupt the VRAM
+ * registry's array out from under a main-thread CUDA-block access.
+ * Held only around the array bookkeeping itself, never across the actual
+ * disk read or cudaMemcpy -- those are the slow parts we want overlapped,
+ * not serialized. */
+static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void expert_cache_evict_one(void) { /* caller holds g_cache_mutex */
     if (!g_resident_n) return;
     int victim = 0;
     for (int i = 1; i < g_resident_n; i++)
@@ -396,6 +410,7 @@ static void expert_cache_evict_one(void) {
 }
 
 static void expert_cache_register(Matrix *weight) {
+    pthread_mutex_lock(&g_cache_mutex);
     if (!g_resident_budget_read) {
         const char *env = getenv("GLM53_EXPERT_RAM_GB");
         double gb = env ? atof(env) : 8.0;
@@ -414,14 +429,17 @@ static void expert_cache_register(Matrix *weight) {
     g_resident[g_resident_n].stamp = ++g_resident_clock;
     g_resident_n++;
     g_resident_bytes += need;
+    pthread_mutex_unlock(&g_cache_mutex);
 }
 
 static void expert_cache_touch(Matrix *weight) {
+    pthread_mutex_lock(&g_cache_mutex);
     for (int i = 0; i < g_resident_n; i++)
         if (g_resident[i].matrix == weight) {
             g_resident[i].stamp = ++g_resident_clock;
-            return;
+            break;
         }
+    pthread_mutex_unlock(&g_cache_mutex);
 }
 
 #ifdef COLI_CUDA
@@ -439,7 +457,7 @@ static size_t g_vram_bytes, g_vram_budget;
 static uint64_t g_vram_clock;
 static int g_vram_budget_read;
 
-static void vram_cache_evict_one(void) {
+static void vram_cache_evict_one(void) { /* caller holds g_cache_mutex */
     if (!g_vram_resident_n) return;
     int victim = 0;
     for (int i = 1; i < g_vram_resident_n; i++)
@@ -453,6 +471,7 @@ static void vram_cache_evict_one(void) {
 
 /* Called BEFORE the upload attempt (weight->cuda still NULL): makes room. */
 static void vram_cache_reserve(Matrix *weight) {
+    pthread_mutex_lock(&g_cache_mutex);
     if (!g_vram_budget_read) {
         const char *env = getenv("CUDA_EXPERT_GB");
         double gb = env ? atof(env) : 2.0;
@@ -462,10 +481,12 @@ static void vram_cache_reserve(Matrix *weight) {
     }
     size_t need = weight->view.data_bytes + weight->view.scale_bytes;
     while (g_vram_resident_n && g_vram_bytes + need > g_vram_budget) vram_cache_evict_one();
+    pthread_mutex_unlock(&g_cache_mutex);
 }
 
 /* Called AFTER a successful upload (weight->cuda now set): registers it. */
 static void vram_cache_register(Matrix *weight) {
+    pthread_mutex_lock(&g_cache_mutex);
     if (g_vram_resident_n == g_vram_resident_cap) {
         g_vram_resident_cap = g_vram_resident_cap ? g_vram_resident_cap * 2 : 64;
         g_vram_resident = realloc(g_vram_resident, (size_t)g_vram_resident_cap * sizeof(*g_vram_resident));
@@ -475,19 +496,23 @@ static void vram_cache_register(Matrix *weight) {
     g_vram_resident[g_vram_resident_n].stamp = ++g_vram_clock;
     g_vram_resident_n++;
     g_vram_bytes += weight->view.data_bytes + weight->view.scale_bytes;
+    pthread_mutex_unlock(&g_cache_mutex);
 }
 
 static void vram_cache_touch(Matrix *weight) {
+    pthread_mutex_lock(&g_cache_mutex);
     for (int i = 0; i < g_vram_resident_n; i++)
         if (g_vram_resident[i].matrix == weight) {
             g_vram_resident[i].stamp = ++g_vram_clock;
-            return;
+            break;
         }
+    pthread_mutex_unlock(&g_cache_mutex);
 }
 
 /* Drops the VRAM-registry bookkeeping only -- does NOT free weight->cuda or
  * touch VRAM itself; the caller (expert_cache_evict_one, on a RAM eviction)
- * does that immediately after. Safe no-op if not currently VRAM-resident. */
+ * does that immediately after. Safe no-op if not currently VRAM-resident.
+ * Caller holds g_cache_mutex (called only from expert_cache_evict_one). */
 static void vram_cache_remove(Matrix *weight) {
     for (int i = 0; i < g_vram_resident_n; i++)
         if (g_vram_resident[i].matrix == weight) {
