@@ -1009,32 +1009,38 @@ static void ffn_forward(const Config *c, Layer *l, const float *x, int n, float 
             weights[k] = score[best];
             total += weights[k];
         }
-        /* Prefetch expert k+1's weights on a background thread while the main
-         * thread computes expert k. The router already picked every ids[k]
-         * above, so by the time we start k=0 we already know all of them --
-         * nothing here waits on routing, only on disk. Joined before each
-         * compute, so a cold miss is never used half-loaded; a warm cache
-         * (expert_cache_load no-ops if already resident) just means the
-         * thread exits almost immediately and the join costs nothing real. */
-        pthread_t prefetch_thread;
-        int prefetch_pending = 0;
-        PrefetchJob job; /* reused each iteration; always joined before being
-                             overwritten or before this stack frame goes away */
+        /* Prefetch experts 1..topk-1 on background threads, ALL started
+         * before expert 0 even begins computing. The router already picked
+         * every ids[k] above -- nothing here waits on routing, only on
+         * disk. Measured: a single-expert-ahead version of this (prefetch
+         * k+1 while computing k, joined before each use) gave ~18% real
+         * wall-time improvement, which means per-expert disk latency
+         * exceeds what one compute step alone can hide -- concurrent reads
+         * for the whole remaining batch give the disk queue more to work
+         * with instead of draining it one request at a time. Each thread
+         * is joined individually, right before its expert is used, so a
+         * cold miss is never used half-loaded and a warm cache (expert_
+         * cache_load no-ops if already resident) costs only a spawn+join,
+         * not a real read. */
+        pthread_t prefetch_threads[64];
+        int prefetch_pending[64] = {0};
+        PrefetchJob prefetch_jobs[64];
+        for (int k = 1; k < c->topk; k++) {
+            prefetch_jobs[k].targets[0] = &l->eg[ids[k]];
+            prefetch_jobs[k].targets[1] = &l->eu[ids[k]];
+            prefetch_jobs[k].targets[2] = &l->ed[ids[k]];
+            prefetch_jobs[k].count = 3;
+            if (pthread_create(&prefetch_threads[k], NULL, prefetch_thread_main, &prefetch_jobs[k]) == 0)
+                prefetch_pending[k] = 1;
+            /* pthread_create failure (resource limits): fall through and let
+             * matrix_multiply's own expert_cache_load cover this expert
+             * synchronously when its turn comes -- correctness intact, just
+             * no overlap for that one expert. */
+        }
         for (int k = 0; k < c->topk; k++) {
-            if (prefetch_pending) {
-                pthread_join(prefetch_thread, NULL);
-                prefetch_pending = 0;
-            }
-            if (k + 1 < c->topk) {
-                job.targets[0] = &l->eg[ids[k + 1]];
-                job.targets[1] = &l->eu[ids[k + 1]];
-                job.targets[2] = &l->ed[ids[k + 1]];
-                job.count = 3;
-                if (pthread_create(&prefetch_thread, NULL, prefetch_thread_main, &job) == 0)
-                    prefetch_pending = 1;
-                /* pthread_create failure (resource limits): fall through and let
-                 * matrix_multiply's own expert_cache_load cover k+1 synchronously
-                 * when its turn comes -- correctness intact, just no overlap. */
+            if (prefetch_pending[k]) {
+                pthread_join(prefetch_threads[k], NULL);
+                prefetch_pending[k] = 0;
             }
             weights[k] = weights[k] / (total + 1e-20f) * c->route_scale;
             mlp3(temp, row, &l->eg[ids[k]], &l->eu[ids[k]], &l->ed[ids[k]], 1, c->moe_inter, c->swiglu_limit);
