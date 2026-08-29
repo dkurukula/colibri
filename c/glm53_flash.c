@@ -138,6 +138,7 @@ typedef struct {
 typedef struct {
     Config c;
     shards tensors;
+    shards mirror_tensors; /* only initialized when COLI_MODEL_MIRROR is set */
     float *embed, *norm, *head;
     Layer *layer;
 } Model;
@@ -523,6 +524,39 @@ static void vram_cache_remove(Matrix *weight) {
 }
 #endif
 
+/* COLI_MODEL_MIRROR: a second, identical copy of the model on a different
+ * physical drive. colibri.c's own mirror support (backend for GLM-5.2)
+ * offers two modes -- whole-tensor replica ROUTING (each tensor served
+ * entirely by one drive, deterministic so page cache never double-caches
+ * it) and O_DIRECT stripe-splitting (one tensor's read chopped across
+ * drives). This ports the first, simpler mode: the concurrent-prefetch
+ * pipeline above already reads several DIFFERENT experts' tensors in
+ * parallel, so spreading those specific reads across two drives raises
+ * aggregate throughput on the same disk queue depth that already helped
+ * (see the ffn_forward comment) -- stripe-splitting a single tensor is a
+ * separate, unvalidated idea and not attempted here.
+ *
+ * Deliberately NO runtime fallback to the primary on a mirror read error:
+ * st_read_f32_cap/st_read_raw_cap already exit(1) on any missing tensor or
+ * short read, on either copy, matching this codebase's existing fatal-
+ * error convention for corrupt/incomplete model data (colibri.c's own
+ * mir_pread does fall back, but that is real, separate engineering this
+ * port does not attempt tonight). The mirror is instead verified
+ * byte-for-byte against the primary, offline, before it is ever pointed
+ * at by COLI_MODEL_MIRROR -- see the deploy notes, not runtime code. */
+static shards *g_mirror_tensors = NULL;
+static int g_mirror_enabled = 0;
+
+static inline int expert_route(const char *name) {
+    if (!g_mirror_enabled) return 0;
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return (int)(h & 1); /* 0 = primary, 1 = mirror -- ~50/50 split by tensor name */
+}
+
 /* Loads a streamed matrix's data from disk and registers it resident, or
  * no-ops if it already is. Factored out of matrix_multiply so a background
  * prefetch thread can call the exact same path the main thread would --
@@ -536,19 +570,21 @@ static void vram_cache_remove(Matrix *weight) {
  * different Matrix than whatever the main thread is computing. */
 static void expert_cache_load(Matrix *weight) {
     if (!weight->streamed) return;
+    shards *src = weight->source;
+    if (expert_route(weight->name)) src = g_mirror_tensors;
     weight->data = malloc(weight->view.data_bytes);
     if (!weight->data) die("glm53: streamed matrix allocation failed");
     weight->view.data = weight->data;
     if (weight->view.format == COLI_TENSOR_F32) {
-        st_read_f32_cap(weight->source, weight->name, weight->data,
+        st_read_f32_cap(src, weight->name, weight->data,
                         (int64_t)(weight->view.data_bytes / sizeof(float)), 1);
     } else {
         weight->scales = alloc_floats(weight->view.scale_bytes / sizeof(float));
         weight->view.scales = weight->scales;
-        st_read_raw_cap(weight->source, weight->name, weight->data, (int64_t)weight->view.data_bytes, 1);
+        st_read_raw_cap(src, weight->name, weight->data, (int64_t)weight->view.data_bytes, 1);
         char scale_name[640];
         snprintf(scale_name, sizeof(scale_name), "%s_scale_inv", weight->name);
-        st_read_f32_cap(weight->source, scale_name, weight->scales,
+        st_read_f32_cap(src, scale_name, weight->scales,
                         (int64_t)(weight->view.scale_bytes / sizeof(float)), 1);
     }
     weight->streamed = 0;
@@ -658,6 +694,13 @@ static void model_load(Model *m, const char *directory) {
     memset(m, 0, sizeof(*m));
     load_config(&m->c, directory);
     st_init(&m->tensors, directory);
+    const char *mirror_dir = getenv("COLI_MODEL_MIRROR");
+    if (mirror_dir && *mirror_dir) {
+        st_init(&m->mirror_tensors, mirror_dir);
+        g_mirror_tensors = &m->mirror_tensors;
+        g_mirror_enabled = 1;
+        fprintf(stderr, "[MIRROR] GLM-5.3 routed-expert reads split between %s and %s\n", directory, mirror_dir);
+    }
     Config *c = &m->c;
     m->embed = load_tensor(m, "model.language_model.embed_tokens.weight");
     m->norm = load_tensor(m, "model.language_model.norm.weight");
