@@ -1,3 +1,4 @@
+
 /* GLM-5.3-Flash inference engine in pure C — sibling of kimi_k3.c / colibri.c /
  * deepseek_v4.c / inkling.c / qwen36.c / olmoe.c, sharing st.h / json.h / tok.h /
  * quant.h / compat.h.
@@ -64,6 +65,9 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdarg.h>
+#ifdef COLI_CUDA
+#include <pthread.h>
+#endif
 
 #include "json.h"
 #include "st.h"
@@ -72,6 +76,12 @@
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 static int g_vk_ready = 0;
+#endif
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+static int g_cuda_ready = 0;
+static double g_cuda_expert_budget_bytes;   /* GLM53_CUDA_EXPERT_GB, VRAM budget for resident experts */
+static double g_cuda_used_bytes;            /* running total across all CUDA-resident expert slots */
 #endif
 #include "compat.h"
 #include <time.h>
@@ -1144,7 +1154,21 @@ typedef struct ERef {
     int contig;                           /* i sei pezzi sono consecutivi in un file */
 } ERef;
 
-typedef struct { int eid; uint8_t *base; uint64_t used; } Slot;
+typedef struct {
+    int eid;
+    uint8_t *base;
+    uint64_t used;
+#ifdef COLI_CUDA
+    /* Set once the three expert matrices are uploaded; freed and cleared
+     * whenever expert_read() is about to overwrite `base` with a different
+     * expert's bytes, or when the CUDA budget evicts this slot to make room
+     * for another. A slot with cg==NULL has never been tried on the GPU, or
+     * the upload failed and it stays CPU-only for good (fmt=4 uploads do not
+     * transiently fail on this backend the way absorb-format uploads can). */
+    void *cg, *cu, *cd;                 /* ColiCudaTensor* for gate/up/down */
+    uint64_t cuda_used;                 /* separate LRU clock for VRAM eviction */
+#endif
+} Slot;
 typedef struct LCache { Slot *s; int n, cap; } LCache;
 
 /* Lunghezze e posizioni dei sei pezzi dentro allo slot. Gate e up sono
@@ -1224,6 +1248,165 @@ static double memory_available_gb(void) {
     return gb;
 }
 
+#ifdef COLI_CUDA
+/* GLM53_CUDA=1 turns this on; GLM53_CUDA_EXPERT_GB sets the VRAM budget for
+ * resident routed experts (unset: whatever coli_cuda_mem_info reports free
+ * on device 0, minus a 512 MB reserve for the backend's own allocations).
+ *
+ * This is a second, independent tier on top of the RAM LRU built by
+ * expert_cache_init below: a slot can be RAM-resident without being
+ * CUDA-resident (the common case, when the VRAM budget is smaller than the
+ * RAM one, which on a 4 GB card is almost always). A slot is never
+ * CUDA-resident without also being RAM-resident, because the upload reads
+ * from slot->base -- so CUDA residency is invalidated whenever the RAM slot
+ * is about to be overwritten (expert_read, below) rather than tracked with
+ * its own separate lifetime.
+ *
+ * Dense/always-resident matrices are Vulkan's job (COLI_VULKAN above, mv());
+ * this tier exists only for the experts that stream from disk, which is
+ * exactly the gap that comment names: a repeat-use expert kept on the GPU
+ * skips both the disk read and the CPU matmul on every later hit, and even a
+ * first-use expert gets its matmul run on the GPU while overlapped disk I/O
+ * fetches the next one. */
+static int g_cuda_device0;
+static Slot **g_cuda_registry;      /* every Slot currently CUDA-resident, across all layers */
+static int g_cuda_registry_n, g_cuda_registry_cap;
+static uint64_t g_cuda_clock;
+/* Guards g_cuda_registry/_n/_cap and g_cuda_used_bytes. expert_read() runs
+ * inside the block reader's #pragma omp parallel for, and it calls
+ * expert_cuda_free_slot() on whatever slot it is about to overwrite -- two
+ * threads can therefore call it at the same time on two different slots,
+ * both mutating this same registry array. Held only around the array/counter
+ * bookkeeping, never across a disk read. */
+static pthread_mutex_t g_cuda_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void expert_cuda_init(void) {
+    const char *on = getenv("GLM53_CUDA");
+    if (!on || !atoi(on)) return;
+    int dev = 0;
+    if (coli_cuda_init(&dev, 1) <= 0) {
+        if (getenv("GLM53_VERBOSE"))
+            fprintf(stderr, "GLM53_CUDA=1 ma nessuna GPU CUDA disponibile\n");
+        return;
+    }
+    g_cuda_device0 = dev;
+    g_cuda_ready = 1;
+    const char *setting = getenv("GLM53_CUDA_EXPERT_GB");
+    if (setting) g_cuda_expert_budget_bytes = atof(setting) * 1e9;
+    else {
+        size_t free_b = 0, total_b = 0;
+        coli_cuda_mem_info(g_cuda_device0, &free_b, &total_b);
+        g_cuda_expert_budget_bytes = (double)free_b - 0.5e9;
+        if (g_cuda_expert_budget_bytes < 0) g_cuda_expert_budget_bytes = 0;
+    }
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "CUDA esperti: budget %.2f GB\n", g_cuda_expert_budget_bytes / 1e9);
+}
+
+/* Drop this slot's GPU upload, if it has one. Safe to call on a slot that
+ * was never uploaded (the common case for most slots on a 4 GB card). The
+ * lock covers the whole body, including the actual device frees, so a
+ * concurrent evict_one() picking the same victim cannot double-free it or
+ * read a half-cleared slot -- coli_cuda_tensor_free() is a quick device
+ * deallocation, not disk I/O, so holding the lock across it is cheap. */
+static void expert_cuda_free_slot(Slot *slot) {
+    pthread_mutex_lock(&g_cuda_mutex);
+    if (!slot->cg && !slot->cu && !slot->cd) { pthread_mutex_unlock(&g_cuda_mutex); return; }
+    if (slot->cg) coli_cuda_tensor_free((ColiCudaTensor *)slot->cg);
+    if (slot->cu) coli_cuda_tensor_free((ColiCudaTensor *)slot->cu);
+    if (slot->cd) coli_cuda_tensor_free((ColiCudaTensor *)slot->cd);
+    slot->cg = slot->cu = slot->cd = NULL;
+    for (int i = 0; i < g_cuda_registry_n; i++)
+        if (g_cuda_registry[i] == slot) {
+            g_cuda_registry[i] = g_cuda_registry[--g_cuda_registry_n];
+            break;
+        }
+    pthread_mutex_unlock(&g_cuda_mutex);
+}
+
+/* Only called from the serial compute loop (via expert_cuda_make_room), so
+ * this never races another evict_one -- but a concurrent expert_read() on a
+ * different slot can call expert_cuda_free_slot() at the same time, so the
+ * registry pick, the removal, and the actual frees all happen under one lock
+ * acquisition (not delegated to expert_cuda_free_slot, which would deadlock
+ * re-entering a non-recursive mutex). */
+static void expert_cuda_evict_one(void) {
+    pthread_mutex_lock(&g_cuda_mutex);
+    if (g_cuda_registry_n == 0) { pthread_mutex_unlock(&g_cuda_mutex); return; }
+    int lru = 0;
+    for (int i = 1; i < g_cuda_registry_n; i++)
+        if (g_cuda_registry[i]->cuda_used < g_cuda_registry[lru]->cuda_used) lru = i;
+    Slot *victim = g_cuda_registry[lru];
+    g_cuda_registry[lru] = g_cuda_registry[--g_cuda_registry_n];
+    size_t freed = coli_cuda_tensor_bytes((ColiCudaTensor *)victim->cg)
+                 + coli_cuda_tensor_bytes((ColiCudaTensor *)victim->cu)
+                 + coli_cuda_tensor_bytes((ColiCudaTensor *)victim->cd);
+    coli_cuda_tensor_free((ColiCudaTensor *)victim->cg);
+    coli_cuda_tensor_free((ColiCudaTensor *)victim->cu);
+    coli_cuda_tensor_free((ColiCudaTensor *)victim->cd);
+    victim->cg = victim->cu = victim->cd = NULL;
+    g_cuda_used_bytes -= (double)freed;
+    if (g_cuda_used_bytes < 0) g_cuda_used_bytes = 0;
+    pthread_mutex_unlock(&g_cuda_mutex);
+}
+
+/* Ensure room for one more expert's worth of VRAM (est_bytes: m->e_slot,
+ * the same packed size the RAM slot already holds), evicting the
+ * least-recently-used CUDA experts if needed. Idempotent on a slot that is
+ * already resident (just bumps its LRU clock). Returns 0 when even a fully
+ * evicted budget cannot hold one expert -- the caller stays on CPU. */
+static int expert_cuda_make_room(Slot *slot, size_t est_bytes) {
+    if (!g_cuda_ready) return 0;
+    if (slot->cg) { slot->cuda_used = ++g_cuda_clock; return 1; }
+    if ((double)est_bytes > g_cuda_expert_budget_bytes) return 0;
+    while (g_cuda_used_bytes + (double)est_bytes > g_cuda_expert_budget_bytes
+           && g_cuda_registry_n > 0)
+        expert_cuda_evict_one();
+    return g_cuda_used_bytes + (double)est_bytes <= g_cuda_expert_budget_bytes;
+}
+
+/* Register a slot for LRU/eviction bookkeeping right after its first
+ * successful upload (slot->cg going NULL -> non-NULL). Bytes are only
+ * counted once per slot -- the caller must not call this on a slot that was
+ * already resident before its own upload attempt. */
+static void expert_cuda_register_new(Slot *slot, size_t est_bytes) {
+    pthread_mutex_lock(&g_cuda_mutex);
+    slot->cuda_used = ++g_cuda_clock;
+    g_cuda_used_bytes += (double)est_bytes;
+    if (g_cuda_registry_n == g_cuda_registry_cap) {
+        g_cuda_registry_cap = g_cuda_registry_cap ? g_cuda_registry_cap * 2 : 64;
+        g_cuda_registry = realloc(g_cuda_registry,
+                                  (size_t)g_cuda_registry_cap * sizeof(*g_cuda_registry));
+        if (!g_cuda_registry) { fprintf(stderr, "OOM sul registro CUDA\n"); exit(1); }
+    }
+    g_cuda_registry[g_cuda_registry_n++] = slot;
+    pthread_mutex_unlock(&g_cuda_mutex);
+}
+
+/* GPU replacement for mlp3() on one expert, one token (S=1): gate and up run
+ * on the device (coli_cuda_matmul uploads slot->cg/cu on the first call for
+ * this slot and reuses them after -- the persistent-tensor pattern mv() uses
+ * for Vulkan, mirrored here for CUDA), the clamp comes back to the CPU
+ * because the fused coli_cuda_expert_mlp kernel only knows plain SiLU and
+ * glm53's SwiGLU is clamped (see swiglu_clamped's comment -- this is not
+ * optional), then down runs on the device from the clamped result. Returns 0
+ * on any failure and leaves *out untouched; the caller falls back to mlp3(). */
+static int expert_cuda_mlp3(Slot *slot, const Mat *gate, const Mat *up, const Mat *down,
+                            float limit, const float *x, float *sg, float *su, float *out) {
+    if (!coli_cuda_matmul((ColiCudaTensor **)&slot->cg, sg, x, gate->q4, gate->s,
+                          gate->fmt, 1, gate->columns, gate->rows, g_cuda_device0, gate->gs))
+        return 0;
+    if (!coli_cuda_matmul((ColiCudaTensor **)&slot->cu, su, x, up->q4, up->s,
+                          up->fmt, 1, up->columns, up->rows, g_cuda_device0, up->gs))
+        return 0;
+    swiglu_clamped(sg, su, gate->rows, limit);
+    if (!coli_cuda_matmul((ColiCudaTensor **)&slot->cd, out, sg, down->q4, down->s,
+                          down->fmt, 1, down->columns, down->rows, g_cuda_device0, down->gs))
+        return 0;
+    return 1;
+}
+#endif
+
 static void expert_cache_init(GModel *m) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_EXPERT_GB");
@@ -1279,6 +1462,13 @@ static Slot *slot_find(GModel *m, int layer, int eid) {
 
 static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
+#ifdef COLI_CUDA
+    /* base is about to be overwritten with a different expert's bytes; any
+     * GPU upload of the old content is now stale. Freed here rather than
+     * left for the caller because every path that recycles a slot (RAM LRU
+     * eviction, first fill) funnels through this function. */
+    expert_cuda_free_slot(slot);
+#endif
     if (!slot->base) {
         slot->base = malloc((size_t)m->e_slot);
         if (!slot->base) { fprintf(stderr, "OOM su uno slot esperto\n"); exit(1); }
@@ -1487,6 +1677,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             slot->used = ++m->clock;
             Mat gate, up, down;
             expert_mats(m, slot, &gate, &up, &down);
+#ifdef COLI_CUDA
+            int cuda_room = expert_cuda_make_room(slot, m->e_slot);
+            int cuda_new = cuda_room && !slot->cg;
+#endif
             for (int t = 0; t < tokens; t++) {
                 float scale = 0.0f;
                 for (int k = 0; k < topk; k++)
@@ -1495,6 +1689,16 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                         break;
                     }
                 if (scale == 0.0f) continue;          /* non lo ha scelto */
+#ifdef COLI_CUDA
+                int done = 0;
+                if (cuda_room) {
+                    done = expert_cuda_mlp3(slot, &gate, &up, &down, c->swiglu_limit,
+                                            x + (size_t)t * c->hidden, sg, su, tmp);
+                    if (done && cuda_new) { expert_cuda_register_new(slot, m->e_slot); cuda_new = 0; }
+                    if (!done) { expert_cuda_free_slot(slot); cuda_room = 0; }
+                }
+                if (!done)
+#endif
                 mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
                      c->swiglu_limit, sg, su);
                 float *dst = out + (size_t)t * c->hidden;
@@ -1680,6 +1884,9 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
      * da quanto hanno gia' preso i pesi, e prima del ciclo sui layer non
      * l'avevano ancora preso. */
     if (m->streaming) expert_cache_init(m);
+#ifdef COLI_CUDA
+    if (m->streaming) expert_cuda_init();
+#endif
 }
 
 /* ---------- vision ----------

@@ -1,3 +1,4 @@
+
 # --- Target detection ---
 # Ask the compiler what it actually targets (rofl0r's note on #129): a gcc/clang
 # toolchain reports its target triple via `-dumpmachine`, e.g.
@@ -1056,10 +1057,13 @@ NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
 # GLM-5.3-Flash: CPU puro, esperti in streaming dal contenitore int4 gs64.
-# Nessun oggetto CUDA/Vulkan/Metal fra le dipendenze perche' il motore non ne
-# ha ancora: quando li avra', questa riga somigliera' a quella di kimi_k3.
-glm53$(EXE): glm53.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h $(VK_OBJ) $(VK_SPV)
-	$(CC) $(CFLAGS) glm53.c $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
+# CUDA_OBJ is the generic backend (colibri.c/kimi_k3.c's own), not an
+# engine-specific .cu: glm53's experts are already the same int4-g64
+# container GLM-5.2 uses, so coli_cuda_matmul/coli_cuda_tensor_upload_g need
+# nothing new on the device side. Metal is not wired yet (Vulkan and CUDA
+# cover the resident matrices and the expert tier respectively).
+glm53$(EXE): glm53.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_cuda.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
