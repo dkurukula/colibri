@@ -126,6 +126,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S);
 
+/* Same fused pipeline, for engines whose SwiGLU is clamped rather than plain
+ * SiLU (glm53.c: gate has a ceiling, up is bounded both ways at `limit`).
+ * Do not use coli_cuda_expert_mlp for such an engine -- it has no clamp and
+ * will silently produce a wrong (if plausible-looking) answer. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_clamped(ColiCudaTensor *gate, ColiCudaTensor *up,
+                         ColiCudaTensor *down, float *y, const float *x, int S, float limit);
+
 /* Prefill-oriented shared expert path.  INT4 weights stay packed in global
  * memory, activations are converted to FP16 per tile, and Tensor Cores
  * accumulate into FP32.  Unlike COLI_CUDA_TC_INT4 this does not quantize the

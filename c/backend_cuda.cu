@@ -627,6 +627,20 @@ __global__ static void silu_mul(float *gate, const float *up, size_t n) {
     }
 }
 
+/* Same as silu_mul, but for engines whose SwiGLU is clamped (GLM-5.3: gate
+ * has a ceiling only, up is bounded both ways) -- bit-identical in structure
+ * to glm53.c's own swiglu_clamped() on the host, just run in place on the
+ * device so the gate/up intermediates never have to leave VRAM for it. */
+__global__ static void silu_mul_clamped(float *gate, const float *up, size_t n, float limit) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i] > limit ? limit : gate[i];
+        float u = up[i];
+        u = u < -limit ? -limit : (u > limit ? limit : u);
+        gate[i] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
 /* Four warps share one A tile and compute 16x64 outputs.  This matters for
  * prefill: the first prototype reloaded/converter A once per 16 output cols. */
 __global__ static void w4a16_matmul(float *y,const float *x,const uint8_t *w,
@@ -1772,6 +1786,44 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     quant_matmul_launch(ctx->y,ctx->gate,down->weights,down->scales,
         down->fmt,S,I,D,row_bytes(down->fmt,I),down->gs,down->ng);
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
+        !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
+    return 1;
+}
+
+/* Identical to coli_cuda_expert_mlp above, except the SwiGLU activation runs
+ * clamped (silu_mul_clamped instead of silu_mul) for engines like glm53.c
+ * where the text MLP is not plain SiLU. One host->device transfer for x, one
+ * device->host transfer for y -- gate/up/down and the activation in between
+ * never touch the host, same as the unclamped version. */
+extern "C" int coli_cuda_expert_mlp_clamped(ColiCudaTensor *gate, ColiCudaTensor *up,
+                                      ColiCudaTensor *down, float *y,
+                                      const float *x, int S, float limit) {
+    if (fault_injected()) return 0;
+    if (gate && ((gate->fmt == 4 && gate->gs <= 0) ||
+                 (up && up->fmt == 4 && up->gs <= 0) ||
+                 (down && down->fmt == 4 && down->gs <= 0))) return 0;
+    if (!gate || !up || !down || !x || !y || S < 1 ||
+        gate->device != up->device || gate->device != down->device ||
+        gate->I != up->I || gate->O != up->O ||
+        down->I != gate->O || down->O != gate->I) return 0;
+    DeviceContext *ctx = find_ctx(gate->device);
+    if (!select_ctx(ctx)) return 0;
+    int D = gate->I, I = gate->O;
+    size_t xb=(size_t)S*D*sizeof(float), ib=(size_t)S*I*sizeof(float);
+    size_t yb=(size_t)S*D*sizeof(float);
+    if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
+        !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
+    if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
+    quant_matmul_launch(ctx->gate,ctx->x,gate->weights,gate->scales,
+        gate->fmt,S,D,I,row_bytes(gate->fmt,D),gate->gs,gate->ng);
+    quant_matmul_launch(ctx->up,ctx->x,up->weights,up->scales,
+        up->fmt,S,D,I,row_bytes(up->fmt,D),up->gs,up->ng);
+    size_t n=(size_t)S*I;
+    silu_mul_clamped<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n,limit);
+    if (down->fmt == 6 && !e8_rot_rows_dev(ctx->gate, S, I, 0)) return 0;
+    quant_matmul_launch(ctx->y,ctx->gate,down->weights,down->scales,
+        down->fmt,S,I,D,row_bytes(down->fmt,I),down->gs,down->ng);
+    if (!cuda_ok(cudaGetLastError(),"expert MLP clamped launch") ||
         !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
     return 1;
 }

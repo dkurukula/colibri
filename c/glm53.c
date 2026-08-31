@@ -82,6 +82,9 @@ static int g_vk_ready = 0;
 static int g_cuda_ready = 0;
 static double g_cuda_expert_budget_bytes;   /* GLM53_CUDA_EXPERT_GB, VRAM budget for resident experts */
 static double g_cuda_used_bytes;            /* running total across all CUDA-resident expert slots */
+static long g_cuda_calls_gpu = 0;           /* expert_cuda_mlp3() calls that succeeded */
+static long g_cuda_calls_cpu_noroom = 0;    /* fell back to CPU: could not make VRAM room */
+static long g_cuda_calls_cpu_failed = 0;    /* fell back to CPU: expert_cuda_mlp3() returned 0 */
 #endif
 #include "compat.h"
 #include <time.h>
@@ -1383,27 +1386,35 @@ static void expert_cuda_register_new(Slot *slot, size_t est_bytes) {
     pthread_mutex_unlock(&g_cuda_mutex);
 }
 
-/* GPU replacement for mlp3() on one expert, one token (S=1): gate and up run
- * on the device (coli_cuda_matmul uploads slot->cg/cu on the first call for
- * this slot and reuses them after -- the persistent-tensor pattern mv() uses
- * for Vulkan, mirrored here for CUDA), the clamp comes back to the CPU
- * because the fused coli_cuda_expert_mlp kernel only knows plain SiLU and
- * glm53's SwiGLU is clamped (see swiglu_clamped's comment -- this is not
- * optional), then down runs on the device from the clamped result. Returns 0
- * on any failure and leaves *out untouched; the caller falls back to mlp3(). */
+/* GPU replacement for mlp3() on one expert, one token (S=1). First pass of
+ * this port ran gate, the clamp, and down as three separate host-syncing
+ * calls per expert -- measured on real hardware, that gave only a ~7% win:
+ * nvidia-smi showed the card mostly idle between calls, so per-call launch
+ * and sync overhead was eating the compute-time savings (thousands of tiny
+ * synchronous round trips per decode step). backend_cuda.cu now has
+ * coli_cuda_expert_mlp_clamped, a clamp-aware twin of the existing fused
+ * coli_cuda_expert_mlp: gate, up, the clamp, and down all run on the device
+ * back to back, with exactly one host->device transfer (x in) and one
+ * device->host transfer (the result out) for the whole expert, matching the
+ * unclamped kernel's own transfer count. sg/su are no longer touched here --
+ * kept as unused parameters so the caller (which still needs them for the
+ * mlp3() CPU fallback on the same call site) does not need two code paths.
+ * Returns 0 on any failure and leaves *out untouched; the caller falls back
+ * to mlp3(). */
 static int expert_cuda_mlp3(Slot *slot, const Mat *gate, const Mat *up, const Mat *down,
                             float limit, const float *x, float *sg, float *su, float *out) {
-    if (!coli_cuda_matmul((ColiCudaTensor **)&slot->cg, sg, x, gate->q4, gate->s,
-                          gate->fmt, 1, gate->columns, gate->rows, g_cuda_device0, gate->gs))
+    (void)sg; (void)su;
+    if (!coli_cuda_tensor_upload_g((ColiCudaTensor **)&slot->cg, gate->q4, gate->s,
+                                   gate->fmt, gate->columns, gate->rows, g_cuda_device0, gate->gs))
         return 0;
-    if (!coli_cuda_matmul((ColiCudaTensor **)&slot->cu, su, x, up->q4, up->s,
-                          up->fmt, 1, up->columns, up->rows, g_cuda_device0, up->gs))
+    if (!coli_cuda_tensor_upload_g((ColiCudaTensor **)&slot->cu, up->q4, up->s,
+                                   up->fmt, up->columns, up->rows, g_cuda_device0, up->gs))
         return 0;
-    swiglu_clamped(sg, su, gate->rows, limit);
-    if (!coli_cuda_matmul((ColiCudaTensor **)&slot->cd, out, sg, down->q4, down->s,
-                          down->fmt, 1, down->columns, down->rows, g_cuda_device0, down->gs))
+    if (!coli_cuda_tensor_upload_g((ColiCudaTensor **)&slot->cd, down->q4, down->s,
+                                   down->fmt, down->columns, down->rows, g_cuda_device0, down->gs))
         return 0;
-    return 1;
+    return coli_cuda_expert_mlp_clamped((ColiCudaTensor *)slot->cg, (ColiCudaTensor *)slot->cu,
+                                        (ColiCudaTensor *)slot->cd, out, x, 1, limit);
 }
 #endif
 
@@ -1695,7 +1706,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                     done = expert_cuda_mlp3(slot, &gate, &up, &down, c->swiglu_limit,
                                             x + (size_t)t * c->hidden, sg, su, tmp);
                     if (done && cuda_new) { expert_cuda_register_new(slot, m->e_slot); cuda_new = 0; }
-                    if (!done) { expert_cuda_free_slot(slot); cuda_room = 0; }
+                    if (done) g_cuda_calls_gpu++;
+                    else { expert_cuda_free_slot(slot); cuda_room = 0; g_cuda_calls_cpu_failed++; }
+                } else {
+                    g_cuda_calls_cpu_noroom++;
                 }
                 if (!done)
 #endif
@@ -2958,6 +2972,10 @@ int main(int argc, char **argv) {
     if (model.streaming)
         printf("experts hits %ld miss %ld bytes %llu\n",
                model.hits, model.miss, (unsigned long long)model.ebytes);
+#ifdef COLI_CUDA
+    printf("cuda dispatch gpu %ld cpu_noroom %ld cpu_failed %ld\n",
+           g_cuda_calls_gpu, g_cuda_calls_cpu_noroom, g_cuda_calls_cpu_failed);
+#endif
     free(logits);
     session_close(&model, session);
     free(vision);
