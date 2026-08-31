@@ -1,4 +1,3 @@
-
 /* GLM-5.3-Flash inference engine in pure C — sibling of kimi_k3.c / colibri.c /
  * deepseek_v4.c / inkling.c / qwen36.c / olmoe.c, sharing st.h / json.h / tok.h /
  * quant.h / compat.h.
@@ -92,6 +91,17 @@ static long g_cuda_calls_cpu_failed = 0;    /* fell back to CPU: expert_cuda_mlp
 #include <sys/resource.h>
 #endif
 #include "hyper_connections.h"   /* mHC, condiviso con deepseek_v4.c */
+
+/* Coarse phase timers: where does a decode step actually spend its time?
+ * Printed at exit next to the "experts hits/miss" line. Not gated behind
+ * GLM53_VERBOSE -- the cost of a handful of clock_gettime calls per layer is
+ * noise next to a multi-second forward pass. */
+static double now_s(void);
+static double g_t_hc = 0, g_t_attn = 0, g_t_ffn = 0;
+static double g_t_read = 0, g_t_shared = 0, g_t_expert = 0;
+static double g_t_kda = 0, g_t_mla = 0;
+static double g_t_mla_proj = 0, g_t_mla_index = 0, g_t_mla_attn = 0;
+static double g_pf_hc, g_pf_attn, g_pf_ffn, g_pf_kda, g_pf_mla; /* prefill snapshot */
 
 /* ---------- config ----------
  * Nested like Kimi K3's: the root carries the vision wrapper and `text_config`
@@ -1046,6 +1056,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     unsigned char *valid = malloc((size_t)seen);
     memset(valid, 1, (size_t)seen);
 
+    double t0 = now_s();
     for (int t = 0; t < tokens; t++) {
         const int at = base + t;          /* posizione assoluta nella cache */
         const float *row = x + (size_t)t * c->hidden;
@@ -1057,7 +1068,14 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         mv(here, &l->kva, row);
         rms(here, here, l->kva_ln, L, c->eps);
         /* la query entra nello spazio del latente una volta per testa, invece
-         * che il latente nello spazio della query una volta per posizione */
+         * che il latente nello spazio della query una volta per posizione.
+         * Un solo #pragma omp attorno alle 64 teste invece di 64 mv_rows()
+         * che aprono ciascuna la propria regione: ogni head scrive in una
+         * fetta disgiunta di `absorbed`, quindi e' sicuro parallelizzare
+         * cosi' com'e' -- vedi la nota sui costi fissi in matmul_i4_grouped. */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
         for (int h = 0; h < H; h++)
             mv_rows(absorbed + ((size_t)t * H + h) * L, &l->kvb_kt,
                     queries + ((size_t)t * H + h) * QK, h * L, L);
@@ -1071,6 +1089,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         mv(head_w + (size_t)t * IH, &l->iwp, row);
         for (int h = 0; h < IH; h++) head_w[(size_t)t * IH + h] /= sqrtf((float)IH);
     }
+    g_t_mla_proj += now_s() - t0; t0 = now_s();
 
     const int width = coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail);
     int *selected = malloc((size_t)tokens * width * sizeof(int));
@@ -1079,6 +1098,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                                        c->index_kpool_tail, base, seen)) {
         fprintf(stderr, "selezione indexer fallita\n"); exit(1);
     }
+    g_t_mla_index += now_s() - t0; t0 = now_s();
     /* GLM53_DUMP_INDEX=1 stampa le righe scelte dall'indexer: e' il primo
      * posto da guardare quando il motore diverge solo su certe lunghezze. */
     if (getenv("GLM53_DUMP_INDEX")) {
@@ -1091,12 +1111,21 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     /* Attenzione nello spazio del latente. La scala resta 1/sqrt(qk_nope):
      * il prodotto e' lo stesso numero di prima, calcolato in un altro ordine. */
     float *context = malloc((size_t)H * V * sizeof(float));
-    float *pooled = malloc((size_t)L * sizeof(float));
-    float *score = malloc((size_t)width * sizeof(float));
+    /* Una fetta di `score`/`pooled` per testa, non un buffer condiviso: sotto
+     * al #pragma omp qui sotto le teste corrono in parallelo, e un buffer
+     * unico riscritto da tutte sarebbe una race silenziosa (output sbagliato,
+     * non un crash). Stesso motivo del commento sopra sul loop di proiezione. */
+    float *pooled = malloc((size_t)H * L * sizeof(float));
+    float *score = malloc((size_t)H * width * sizeof(float));
     const float scale = 1.0f / sqrtf((float)QK);
     for (int t = 0; t < tokens; t++) {
         const int *chosen = selected + (size_t)t * width;
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
         for (int h = 0; h < H; h++) {
+            float *hscore = score + (size_t)h * width;
+            float *hpooled = pooled + (size_t)h * L;
             const float *q = absorbed + ((size_t)t * H + h) * L;
             float top = -INFINITY;
             int used = 0;
@@ -1106,28 +1135,29 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                 const float *c_j = latent + (size_t)at * L;
                 float dot = 0.0f;
                 for (int d = 0; d < L; d++) dot += q[d] * c_j[d];
-                score[used] = dot * scale;
-                if (score[used] > top) top = score[used];
+                hscore[used] = dot * scale;
+                if (hscore[used] > top) top = hscore[used];
                 used++;
             }
             float *result = context + (size_t)h * V;
             memset(result, 0, (size_t)V * sizeof(float));
             if (!used) continue;
             double total = 0.0;
-            for (int i = 0; i < used; i++) { score[i] = expf(score[i] - top); total += score[i]; }
-            memset(pooled, 0, (size_t)L * sizeof(float));
+            for (int i = 0; i < used; i++) { hscore[i] = expf(hscore[i] - top); total += hscore[i]; }
+            memset(hpooled, 0, (size_t)L * sizeof(float));
             int seen_slot = 0;
             for (int i = 0; i < width; i++) {
                 const int at = chosen[i];
                 if (at < 0 || at >= seen) continue;
-                const float weight = (float)(score[seen_slot++] / total);
+                const float weight = (float)(hscore[seen_slot++] / total);
                 const float *c_j = latent + (size_t)at * L;
-                for (int d = 0; d < L; d++) pooled[d] += weight * c_j[d];
+                for (int d = 0; d < L; d++) hpooled[d] += weight * c_j[d];
             }
-            mv_rows(result, &l->kvb_v, pooled, h * V, V);
+            mv_rows(result, &l->kvb_v, hpooled, h * V, V);
         }
         mv(out + (size_t)t * c->hidden, &l->o, context);
     }
+    g_t_mla_attn += now_s() - t0;
     free(score); free(pooled);
 
     free(context); free(selected); free(valid); free(head_w);
@@ -1615,9 +1645,11 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     if (!sg || !su || !tmp) { fprintf(stderr, "OOM nel MoE\n"); exit(1); }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
+    { double t0 = now_s();
     for (int t = 0; t < tokens; t++)
         mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
              &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+    g_t_shared += now_s() - t0; }
 
     if (!m->streaming) {
         for (int t = 0; t < tokens; t++)
@@ -1670,6 +1702,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             slot_of[i] = (int)(victim - cache->s);
             to_read[reads++] = i;
         }
+        { double t0 = now_s();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
@@ -1677,11 +1710,13 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             const int i = to_read[r];
             expert_read(m, index, union_ids[base + i], &cache->s[slot_of[i]]);
         }
+        g_t_read += now_s() - t0; }
 
         /* Un esperto per volta, e per ognuno tutti i token che lo hanno
          * scelto. Nell'ordine opposto i suoi 12,6 MB di pesi verrebbero
          * ripercorsi da capo per ogni token, e a questa taglia la banda di
          * memoria e' quanto costa davvero il calcolo. */
+        { double t0 = now_s();
         for (int i = 0; i < here; i++) {
             const int eid = union_ids[base + i];
             Slot *slot = &cache->s[slot_of[i]];
@@ -1719,6 +1754,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
             }
         }
+        g_t_expert += now_s() - t0; }
     }
     free(to_read); free(slot_of); free(union_ids);
     free(tmp); free(su); free(sg); free(weight); free(chosen);
@@ -2073,6 +2109,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             const float *fn = site ? l->hc_ffn_fn : l->hc_attn_fn;
             const float *base = site ? l->hc_ffn_base : l->hc_attn_base;
             const float *scale = site ? l->hc_ffn_scale : l->hc_attn_scale;
+            double t0 = now_s();
             for (int t = 0; t < n; t++)
                 coli_hc_pre(collapsed + (size_t)t * D, post + (size_t)t * H,
                             comb + (size_t)t * H * H, streams + (size_t)t * H * D,
@@ -2080,6 +2117,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             for (int t = 0; t < n; t++)
                 rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
                     site ? l->post_ln : l->in_ln, D, c->eps);
+            g_t_hc += now_s() - t0; t0 = now_s();
             if (!site) {
                 GLayerState *st = &s->layer[i];
                 /* Lo stato non si azzera a ogni chiamata: e' della
@@ -2088,13 +2126,18 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                 if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
                 else kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
                                s->kda_scratch);
+                { double dt = now_s() - t0; g_t_attn += dt;
+                  if (c->is_full[i]) g_t_mla += dt; else g_t_kda += dt; }
             } else {
                 ffn_layer(m, l, i, normed, n, branch);
+                g_t_ffn += now_s() - t0;
             }
+            t0 = now_s();
             for (int t = 0; t < n; t++)
                 coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
                              streams + (size_t)t * H * D, post + (size_t)t * H,
                              comb + (size_t)t * H * H, H, D);
+            g_t_hc += now_s() - t0;
             float *swap = streams; streams = next; next = swap;
         }
     }
@@ -2913,6 +2956,8 @@ int main(int argc, char **argv) {
     GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1);
     const double prefill_start = now_s();
     float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
+    g_pf_hc = g_t_hc; g_pf_attn = g_t_attn; g_pf_ffn = g_t_ffn;
+    g_pf_kda = g_t_kda; g_pf_mla = g_t_mla;
     if (getenv("GLM53_VERBOSE"))
         fprintf(stderr, "caricamento %.1fs, prefill %d token in %.1fs\n",
                 load_seconds, count, now_s() - prefill_start);
@@ -2976,6 +3021,15 @@ int main(int argc, char **argv) {
     printf("cuda dispatch gpu %ld cpu_noroom %ld cpu_failed %ld\n",
            g_cuda_calls_gpu, g_cuda_calls_cpu_noroom, g_cuda_calls_cpu_failed);
 #endif
+    printf("phases hc %.1fs attn %.1fs (kda %.1fs mla %.1fs) ffn %.1fs (read %.1fs shared %.1fs expert %.1fs)\n",
+           g_t_hc, g_t_attn, g_t_kda, g_t_mla, g_t_ffn, g_t_read, g_t_shared, g_t_expert);
+    printf("phases_prefill hc %.1fs attn %.1fs (kda %.1fs mla %.1fs) ffn %.1fs\n",
+           g_pf_hc, g_pf_attn, g_pf_kda, g_pf_mla, g_pf_ffn);
+    printf("phases_decode hc %.1fs attn %.1fs (kda %.1fs mla %.1fs) ffn %.1fs\n",
+           g_t_hc - g_pf_hc, g_t_attn - g_pf_attn, g_t_kda - g_pf_kda,
+           g_t_mla - g_pf_mla, g_t_ffn - g_pf_ffn);
+    printf("mla_sub proj %.1fs index %.1fs attn %.1fs\n",
+           g_t_mla_proj, g_t_mla_index, g_t_mla_attn);
     free(logits);
     session_close(&model, session);
     free(vision);
