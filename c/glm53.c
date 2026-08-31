@@ -102,6 +102,8 @@ static double g_t_read = 0, g_t_shared = 0, g_t_expert = 0;
 static double g_t_kda = 0, g_t_mla = 0;
 static double g_t_mla_proj = 0, g_t_mla_index = 0, g_t_mla_attn = 0;
 static double g_pf_hc, g_pf_attn, g_pf_ffn, g_pf_kda, g_pf_mla; /* prefill snapshot */
+static double g_pf_read, g_pf_shared, g_pf_expert;
+static long g_contig_yes = 0, g_contig_no = 0;
 
 /* ---------- config ----------
  * Nested like Kimi K3's: the root carries the vision wrapper and `text_config`
@@ -1520,6 +1522,17 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
         for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
             st_pread_full(ref->fd[p], slot->base + m->e_at[p], m->e_len[p],
                           ref->off[p], "expert piece");
+    }
+    if (ref->contig) {
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+        g_contig_yes++;
+    } else {
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+        g_contig_no++;
     }
     slot->eid = eid;
     /* expert_read gira dentro a un ciclo parallelo: i contatori sono condivisi
@@ -2958,6 +2971,7 @@ int main(int argc, char **argv) {
     float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
     g_pf_hc = g_t_hc; g_pf_attn = g_t_attn; g_pf_ffn = g_t_ffn;
     g_pf_kda = g_t_kda; g_pf_mla = g_t_mla;
+    g_pf_read = g_t_read; g_pf_shared = g_t_shared; g_pf_expert = g_t_expert;
     if (getenv("GLM53_VERBOSE"))
         fprintf(stderr, "caricamento %.1fs, prefill %d token in %.1fs\n",
                 load_seconds, count, now_s() - prefill_start);
@@ -3021,15 +3035,24 @@ int main(int argc, char **argv) {
     printf("cuda dispatch gpu %ld cpu_noroom %ld cpu_failed %ld\n",
            g_cuda_calls_gpu, g_cuda_calls_cpu_noroom, g_cuda_calls_cpu_failed);
 #endif
-    printf("phases hc %.1fs attn %.1fs (kda %.1fs mla %.1fs) ffn %.1fs (read %.1fs shared %.1fs expert %.1fs)\n",
-           g_t_hc, g_t_attn, g_t_kda, g_t_mla, g_t_ffn, g_t_read, g_t_shared, g_t_expert);
-    printf("phases_prefill hc %.1fs attn %.1fs (kda %.1fs mla %.1fs) ffn %.1fs\n",
-           g_pf_hc, g_pf_attn, g_pf_kda, g_pf_mla, g_pf_ffn);
-    printf("phases_decode hc %.1fs attn %.1fs (kda %.1fs mla %.1fs) ffn %.1fs\n",
-           g_t_hc - g_pf_hc, g_t_attn - g_pf_attn, g_t_kda - g_pf_kda,
-           g_t_mla - g_pf_mla, g_t_ffn - g_pf_ffn);
-    printf("mla_sub proj %.1fs index %.1fs attn %.1fs\n",
-           g_t_mla_proj, g_t_mla_index, g_t_mla_attn);
+    /* Scomposizione grezza per fase: dove va davvero il tempo di un passo di
+     * decodifica. Dietro GLM53_VERBOSE come il resto della diagnostica --
+     * il costo di una manciata di clock_gettime per layer e' rumore
+     * accanto a un forward pass di piu' secondi, ma non serve stamparlo
+     * a ogni corsa. */
+    if (getenv("GLM53_VERBOSE")) {
+        printf("phases hc %.1fs attn %.1fs (kda %.1fs mla %.1fs) ffn %.1fs (read %.1fs shared %.1fs expert %.1fs)\n",
+               g_t_hc, g_t_attn, g_t_kda, g_t_mla, g_t_ffn, g_t_read, g_t_shared, g_t_expert);
+        printf("phases_prefill hc %.1fs attn %.1fs (kda %.1fs mla %.1fs) ffn %.1fs\n",
+               g_pf_hc, g_pf_attn, g_pf_kda, g_pf_mla, g_pf_ffn);
+        printf("phases_decode hc %.1fs attn %.1fs (kda %.1fs mla %.1fs) ffn %.1fs (read %.1fs shared %.1fs expert %.1fs)\n",
+               g_t_hc - g_pf_hc, g_t_attn - g_pf_attn, g_t_kda - g_pf_kda,
+               g_t_mla - g_pf_mla, g_t_ffn - g_pf_ffn,
+               g_t_read - g_pf_read, g_t_shared - g_pf_shared, g_t_expert - g_pf_expert);
+        printf("expert_contig yes %ld no %ld\n", g_contig_yes, g_contig_no);
+        printf("mla_sub proj %.1fs index %.1fs attn %.1fs\n",
+               g_t_mla_proj, g_t_mla_index, g_t_mla_attn);
+    }
     free(logits);
     session_close(&model, session);
     free(vision);
