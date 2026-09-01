@@ -476,4 +476,29 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
 }
 
+
+/* Teardown for shards opened via st_init(). Not exercised by colibri.c
+ * (a CLI that finishes lets the OS clean up); glm53.c calls this from
+ * model_release() for the multi-model-per-process case. Matches this
+ * file's shards layout, not upstream's (single mirror copy via
+ * `mfds[512]`/`nmirror`, not upstream's per-replica `mfds[ST_MAX_MIR][512]` --
+ * different feature shape, ported around rather than through). */
+static void st_destroy(shards *S) {
+    if (!S) return;
+    for (int index = 0; index < S->nfd; index++) {
+        if (S->fds[index] >= 0) close(S->fds[index]);
+        if (S->dfds[index] >= 0 && S->dfds[index] != S->fds[index])
+            close(S->dfds[index]);
+        if (S->nmirror > 0) {
+            if (S->mfds[index] >= 0) close(S->mfds[index]);
+            if (S->mdfds[index] >= 0 && S->mdfds[index] != S->mfds[index])
+                close(S->mdfds[index]);
+        }
+        free(S->paths[index]);
+    }
+    for (int index = 0; index < S->n; index++) free(S->t[index].name);
+    free(S->t);
+    free(S->hidx);
+}
+
 #endif
