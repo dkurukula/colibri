@@ -24,6 +24,13 @@
  * malloc gigante prima ancora di leggere: lo respingiamo. */
 #define ST_MAX_HEADER (512ll << 20)
 
+/* Max tensor rank st_tensor records shape for. GLM-5.3's routed-expert
+ * int4 containers are rank-1 (flat nibble blob, shape read but unused --
+ * their real 2D shape comes from config, see quantize_loaded's caller);
+ * every other tensor in this codebase is rank<=2. 8 is upstream's bound,
+ * kept for header-format headroom, not because anything here needs it. */
+#define ST_MAX_RANK 8
+
 typedef struct {
     char   *name;
     int     fd;
@@ -31,6 +38,8 @@ typedef struct {
     int64_t nbytes;
     int     dtype;     /* 0=BF16 1=F16 2=F32 */
     int64_t numel;
+    int     rank;
+    int64_t shape[ST_MAX_RANK];   /* only glm53.c's load_mat() reads this today */
 } st_tensor;
 
 typedef struct {
@@ -307,7 +316,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
              * senza questi guard si dereferenzia NULL (json_get) o si legge
              * off->kids[0/1] oltre i limiti dell'array. */
             if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
-                !shp || shp->t != J_ARR) {
+                !shp || shp->t != J_ARR || shp->len > ST_MAX_RANK) {
                 fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
                         files[fi], name); exit(1); }
             int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
@@ -335,6 +344,8 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+            t->rank = shp->len;
+            for (int k = 0; k < shp->len; k++) t->shape[k] = (int64_t)shp->kids[k]->num;
             /* cross-check the declared element count against the byte span for FLOAT
              * dtypes: st_read_f32 writes `numel` floats (BF16/F16 loop or F32 memcpy)
              * into a caller-sized buffer, so a header with numel != nbytes/esz is an
@@ -474,6 +485,30 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
     free(raw);
     if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
+}
+
+/* Teardown for shards opened via st_init(). Not exercised by colibri.c
+ * (a CLI that finishes lets the OS clean up); glm53.c calls this from
+ * model_release() for the multi-model-per-process case. Matches this
+ * file's shards layout, not upstream's (single mirror copy via
+ * `mfds[512]`/`nmirror`, not upstream's per-replica `mfds[ST_MAX_MIR][512]` --
+ * different feature shape, ported around rather than through). */
+static void st_destroy(shards *S) {
+    if (!S) return;
+    for (int index = 0; index < S->nfd; index++) {
+        if (S->fds[index] >= 0) close(S->fds[index]);
+        if (S->dfds[index] >= 0 && S->dfds[index] != S->fds[index])
+            close(S->dfds[index]);
+        if (S->nmirror > 0) {
+            if (S->mfds[index] >= 0) close(S->mfds[index]);
+            if (S->mdfds[index] >= 0 && S->mdfds[index] != S->mfds[index])
+                close(S->mdfds[index]);
+        }
+        free(S->paths[index]);
+    }
+    for (int index = 0; index < S->n; index++) free(S->t[index].name);
+    free(S->t);
+    free(S->hidx);
 }
 
 #endif

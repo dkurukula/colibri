@@ -423,4 +423,34 @@ static int tok_decode(Tok *T, const int *ids, int n, char *out, int max){
     return o;
 }
 
+
+/* hmap teardown -- purely additive, hmap/ment are byte-identical to
+ * upstream's. free_keys=1 for maps that own their key strings (merges),
+ * 0 for maps whose keys alias storage owned elsewhere (vocab). */
+static void hm_free(hmap *m, int free_keys) {
+    if (!m || !m->e) return;
+    if (free_keys)
+        for (int i = 0; i < m->cap; i++)
+            if (m->e[i].used) free((void *)m->e[i].k);
+    free(m->e);
+    m->e = NULL; m->cap = 0;
+}
+
+/* Teardown for a Tok loaded via tok_load(). Not exercised by colibri.c
+ * (a CLI that finishes lets the OS clean up); glm53.c calls this from
+ * its own shutdown path. Matches this fork's Tok struct, which has no
+ * json_root field to free (unlike upstream's newer Tok) -- this fork's
+ * tok_load extracts what it needs from the parsed JSON and doesn't keep
+ * the tree resident, so there is nothing there to tear down. */
+static void tok_free(Tok *T) {
+    if (!T) return;
+    hm_free(&T->merges, 1);
+    hm_free(&T->vocab, 0);
+    free(T->sp);
+    free(T->id2str);
+    free(T->id_added);
+    free(T->id_special);
+    memset(T, 0, sizeof(*T));
+}
+
 #endif
