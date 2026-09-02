@@ -295,7 +295,7 @@ colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h gramma
 # routed MoE), ported from upstream dev @ 7892f58. No Vulkan tier on this
 # fork (colibri$(EXE) above doesn't build one either) -- CUDA only, same
 # $(CUDA_OBJ) backend_cuda.o colibri links.
-glm53$(EXE): glm53.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_cuda.h $(CUDA_OBJ) .build-config
+glm53$(EXE): glm53.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_cuda.h omp_tune.h $(CUDA_OBJ) .build-config
 	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
