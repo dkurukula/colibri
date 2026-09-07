@@ -632,6 +632,20 @@ static int g_cuda_enabled;
 static double g_cuda_expert_gb;
 static int g_cuda_expert_auto;
 static int g_cuda_dense;
+/* CUDA_DENSE_STREAM (opt-in, default 0): same idea as CUDA_MISS_GPU (see its
+ * own doc comment near the expert-miss ring) but applied to the dense/
+ * attention path instead. A dense tensor that is NOT cuda_eligible (the
+ * tiny expert-cache VRAM budget has no room for it) is normally computed
+ * on CPU every call -- see matmul_qt_ex below. Under this flag it instead
+ * gets uploaded to a TRANSIENT device tensor via the same
+ * coli_cuda_matmul() the resident path uses, computed there, and freed
+ * immediately after -- never kept resident, so every call pays a fresh
+ * H2D transfer, unlike the cached resident path. First cut: no reuse
+ * across calls even though the weights are static, and no cuda_fail_s-
+ * style memoization (each transient call is already independent) --
+ * per-call alloc first, add size-bucketed reuse only if allocation/
+ * transfer churn shows up in measurement. */
+static int g_cuda_dense_stream;
 static int g_cuda_release_host;
 static double g_cuda_reserve_gb;   /* CUDA_RESERVE_GB: VRAM headroom kept free of expert tier (default 2 GB) */
 static int g_cuda_raw_experts=-1;   /* experimental ANS tier: keep this global hot prefix raw */
@@ -1148,6 +1162,21 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
             fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d fell back to CPU at S=%d; "
                 "narrower calls will still try the GPU\n", w->O,w->I,w->cuda_device,S);
         cuda_disabled_note();
+    }
+    /* CUDA_DENSE_STREAM: w is not resident (else the branch above would have
+     * already returned) -- upload transiently, compute, free. tmp is a LOCAL
+     * handle, never written back to w->cuda, so nothing here is kept
+     * resident and the next call re-uploads from scratch. Falls through to
+     * CPU on any failure (tmp may be partially allocated; free handles
+     * NULL). Same fmt exclusions as the resident branch above. */
+    if(g_cuda_dense_stream && g_cuda_enabled && !w->cuda_eligible && w->fmt!=5 &&
+       (w->fmt!=8 || g_cuda_fp8_ready) && !omp_in_parallel()){
+        const void *weights = w->fmt==0 ? (const void*)w->qf
+                            : (w->fmt==1||w->fmt==8) ? (const void*)w->q8 : (const void*)w->q4;
+        ColiCudaTensor *tmp=NULL;
+        int ok=coli_cuda_matmul(&tmp,y,x,weights,w->s,w->fmt,S,w->I,w->O,g_cuda_devices[0],w->gs);
+        if(tmp) coli_cuda_tensor_free(tmp);
+        if(ok) return;
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
@@ -10840,6 +10869,7 @@ int main(int argc, char **argv){
         g_cuda_fp8_ready=coli_cuda_fp8_set_lut(E4M3_LUT);
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+    g_cuda_dense_stream=getenv("CUDA_DENSE_STREAM")?atoi(getenv("CUDA_DENSE_STREAM")):0;
 #endif
 #ifdef COLI_VULKAN
     if(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))){
@@ -10919,9 +10949,10 @@ int main(int argc, char **argv){
     }
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_dense_stream&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE_STREAM requires COLI_CUDA=1\n"); return 2; }
     if((g_cuda_expert_gb>0||g_cuda_expert_auto) && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s\n",
-        g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
+        g_cuda_dense?" + resident dense tensors":g_cuda_dense_stream?" + streamed dense tensors":" only (resident dense on CPU)",
         g_cuda_release_host?"; VRAM experts without host backing":"");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
