@@ -651,6 +651,64 @@ static double g_cuda_reserve_gb;   /* CUDA_RESERVE_GB: VRAM headroom kept free o
 static int g_cuda_raw_experts=-1;   /* experimental ANS tier: keep this global hot prefix raw */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
+#define DENSE_STREAM_POOL_MAX 64
+typedef struct { int fmt,I,O,gs; ColiCudaTensor *t; } DenseStreamSlot;
+static DenseStreamSlot g_dense_stream_pool[DENSE_STREAM_POOL_MAX];
+static int g_dense_stream_pool_n;
+/* CUDA_DENSE_STREAM dispatch: reuse a device buffer across calls sharing
+ * the same (fmt,I,O,gs) shape -- every one of the model's ~15-20 distinct
+ * dense/attention tensor ROLES (q_a, kv_b, sh_gate, ...) repeats that exact
+ * shape across all layers, so this converts "cudaMalloc+cudaFree every
+ * single call" into "cudaMalloc once per distinct shape, cudaMemcpy every
+ * call" for every call past the first to use a given shape. Measured on an
+ * R720 + GTX 1050 Ti: ~117ms/call before this (a GLM-5.3 attention-
+ * projection matmul does not take anywhere near that long to transfer or
+ * compute), consistent with cudaMalloc/cudaFree churn, not PCIe bandwidth
+ * or kernel time; with the pool, per-request attention_s dropped ~38% and
+ * the CPU threads doing dense compute went from 63-94% busy to mostly
+ * idle (one dispatch thread stays busy issuing the now-cheap calls).
+ *
+ * Correctness note: coli_cuda_tensor_upload() (called inside
+ * coli_cuda_matmul) is a no-op once *tensor is non-NULL and the shape
+ * matches -- it does NOT refresh device contents on repeat calls, by
+ * design, for the resident-tensor case where the same expert/tensor is
+ * reused as-is. Reusing a pooled slot across DIFFERENT layers that only
+ * share a shape would silently compute against the PREVIOUS layer's
+ * stale weights if we relied on that path, so this calls
+ * coli_cuda_tensor_update() itself first to push this call's specific
+ * data into the slot before compute. Pool is bounded by distinct shapes
+ * encountered, not call count or layer count -- measured under 1.2 GB VRAM
+ * for this model. */
+static int dense_stream_matmul(float *y, const float *x, QT *w, int S){
+    const void *weights = w->fmt==0 ? (const void*)w->qf
+                        : (w->fmt==1||w->fmt==8) ? (const void*)w->q8 : (const void*)w->q4;
+    for(int i=0;i<g_dense_stream_pool_n;i++){
+        DenseStreamSlot *s=&g_dense_stream_pool[i];
+        if(s->fmt==w->fmt && s->I==w->I && s->O==w->O && s->gs==w->gs){
+            if(!coli_cuda_tensor_update(s->t, weights, w->s)) return 0;
+            return coli_cuda_matmul(&s->t,y,x,weights,w->s,w->fmt,S,w->I,w->O,g_cuda_devices[0],w->gs);
+        }
+    }
+    if(g_dense_stream_pool_n < DENSE_STREAM_POOL_MAX){
+        ColiCudaTensor *tmp=NULL;
+        if(!coli_cuda_matmul(&tmp,y,x,weights,w->s,w->fmt,S,w->I,w->O,g_cuda_devices[0],w->gs)){
+            if(tmp) coli_cuda_tensor_free(tmp);
+            return 0;
+        }
+        DenseStreamSlot *s=&g_dense_stream_pool[g_dense_stream_pool_n++];
+        s->fmt=w->fmt; s->I=w->I; s->O=w->O; s->gs=w->gs; s->t=tmp;
+        return 1;
+    }
+    /* pool full (should not happen given the model's fixed tensor roles,
+     * but stay correct if it ever does): transient alloc+free, no caching,
+     * same as the pre-pool first cut. */
+    {
+        ColiCudaTensor *tmp=NULL;
+        int ok=coli_cuda_matmul(&tmp,y,x,weights,w->s,w->fmt,S,w->I,w->O,g_cuda_devices[0],w->gs);
+        if(tmp) coli_cuda_tensor_free(tmp);
+        return ok;
+    }
+}
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_fail_s=0;
@@ -1171,12 +1229,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
      * NULL). Same fmt exclusions as the resident branch above. */
     if(g_cuda_dense_stream && g_cuda_enabled && !w->cuda_eligible && w->fmt!=5 &&
        (w->fmt!=8 || g_cuda_fp8_ready) && !omp_in_parallel()){
-        const void *weights = w->fmt==0 ? (const void*)w->qf
-                            : (w->fmt==1||w->fmt==8) ? (const void*)w->q8 : (const void*)w->q4;
-        ColiCudaTensor *tmp=NULL;
-        int ok=coli_cuda_matmul(&tmp,y,x,weights,w->s,w->fmt,S,w->I,w->O,g_cuda_devices[0],w->gs);
-        if(tmp) coli_cuda_tensor_free(tmp);
-        if(ok) return;
+        if(dense_stream_matmul(y,x,w,S)) return;
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
