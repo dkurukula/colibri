@@ -90,6 +90,7 @@ static long g_cuda_calls_cpu_failed = 0;    /* fell back to CPU: expert_cuda_mlp
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
+#include "omp_tune.h"            /* coli_omp_tune_threads: physical-core sizing */
 #include "hyper_connections.h"   /* mHC, condiviso con deepseek_v4.c */
 
 /* Coarse phase timers: where does a decode step actually spend its time?
@@ -2850,6 +2851,15 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
 
 #ifndef GLM53_NO_MAIN
 int main(int argc, char **argv) {
+    /* Size the OpenMP team to physical cores. This engine's decode is a chain of
+     * many small S=1 matmuls; on an SMT machine the default team (one thread per
+     * LOGICAL cpu) puts two hardware threads on every core, and the sibling pair
+     * contends for the same execution ports on the int4 kernel. Measured on a
+     * dual E5-2660v2 (20C/40T): the CPU attention phases run ~3x slower at 40
+     * logical threads than at 20 physical (kda decode 2.5s -> 0.7-0.8s), a
+     * ~1.6-1.9x decode speedup overall. The helper respects a user-set
+     * OMP_NUM_THREADS and no-ops when the physical count is unknown (see #718). */
+    coli_omp_tune_threads("glm53");
     const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
     int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
     for (int i = 1; i < argc; i++) {
