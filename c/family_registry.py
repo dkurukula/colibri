@@ -4,7 +4,12 @@
 from dataclasses import dataclass
 import json
 import re
+import sys
 from pathlib import Path
+
+# slots=True on @dataclass needs Python 3.10+; the production runtime image
+# (RHEL9/UBI9-based) ships 3.9, so fall back to frozen-only there.
+_DC = {"frozen": True, "slots": True} if sys.version_info >= (3, 10) else {"frozen": True}
 
 
 class RegistryError(ValueError):
@@ -23,7 +28,7 @@ class PlannerUnsupportedError(ValueError):
     pass
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(**_DC)
 class FamilyCapabilities:
     tools: bool
     grammar_payload: bool
@@ -31,7 +36,7 @@ class FamilyCapabilities:
     thinking: bool
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(**_DC)
 class FamilyLimits:
     default_context: int
     max_context: int
@@ -42,7 +47,7 @@ class FamilyLimits:
     context_env: str
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(**_DC)
 class PlannerGeometry:
     context_state_bytes: int
     fixed_state_bytes: int
@@ -50,7 +55,7 @@ class PlannerGeometry:
     configured_experts: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(**_DC)
 class FamilyDescriptor:
     id: str
     model_types: tuple
@@ -78,7 +83,7 @@ class FamilyDescriptor:
     tune_prompt_template: str = "{prompt}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(**_DC)
 class ResolvedFamily:
     descriptor: FamilyDescriptor
     model_type: str
